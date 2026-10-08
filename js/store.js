@@ -39,51 +39,78 @@ const idbClear = () => tx('readwrite', (s) => s.clear());
 
 const newer = (a, b) => (String(a?.updatedAt || '') >= String(b?.updatedAt || '') ? a : b);
 
-// تحميل أولي: يعيد {status:'plain'|'locked'|'new', data?, vault?, migratedFrom?}
+// ---------- حالة القفل ----------
+// علامة مستقلة عن الخزنة: إن كانت مفعّلة لا يُفتح التطبيق أبدًا دون خزنة صالحة ومصادقة.
+const LOCK_FLAG = 'folosi_lock_v1';
+export async function lockFlag() {
+  if (lsGet(LOCK_FLAG) === 'on') return true;
+  const m = await idbGet('meta:lock');
+  return m?.on === true;
+}
+async function setLockFlag(on) {
+  if (on) lsSet(LOCK_FLAG, 'on'); else lsDel(LOCK_FLAG);
+  await idbPut('meta:lock', { on: !!on, at: new Date().toISOString() }).catch(() => {});
+}
+const validVault = (v) => v?.app === 'folosi' && typeof v.ct === 'string' && typeof v.iv === 'string' && v.keys?.pin;
+
+// تحميل أولي. الحالات: locked | plain | new | error — ولا يُنشأ ملف جديد أبدًا إن وُجد ما يدل على بيانات سابقة.
 export async function loadInitial() {
-  await openDB();
-  const lsVault = parse(lsGet(K.vault)), idbVault = await idbGet('vault');
-  const vaults = [lsVault, idbVault].filter((v) => v?.app === 'folosi' && v.ct);
-  const lsPlain = parse(lsGet(K.data)), idbPlain = await idbGet('latest');
+  const dbOk = !!(await openDB());
+  const rawLsVault = lsGet(K.vault);
+  const lsVault = parse(rawLsVault), idbVault = dbOk ? await idbGet('vault') : null;
+  const vaults = [lsVault, idbVault].filter(validVault);
+  const flag = await lockFlag();
+  if (vaults.length) {
+    if (!flag) await setLockFlag(true); // مستخدمو 3.0.1: تُسجل العلامة لأول مرة
+    return { status: 'locked', vault: vaults.reduce(newer) }; // وجود خزنة = قفل دائمًا، مهما كانت النسخ الأخرى
+  }
+  if (flag || rawLsVault || (dbOk && idbVault)) // القفل مفعّل لكن الخزنة مفقودة أو تالفة: لا فتح تلقائي
+    return { status: 'error', reason: 'vault-missing', dbOk };
+  const lsPlain = parse(lsGet(K.data)), idbPlain = dbOk ? await idbGet('latest') : null;
   const plains = [lsPlain, idbPlain].filter(isStructurallyValid);
-  const vault = vaults.length ? vaults.reduce(newer) : null;
   const plain = plains.length ? plains.reduce(newer) : null;
-  if (vault && (!plain || String(vault.updatedAt) >= String(plain.updatedAt || ''))) return { status: 'locked', vault };
   if (plain) {
     const from = Number(plain.schema) || 2;
-    if (from < SCHEMA && !(await idbGet('backup-before-v3'))) {
+    if (from < SCHEMA && dbOk && !(await idbGet('backup-before-v3'))) {
       // نسخة أمان من بيانات الإصدار السابق قبل أي ترحيل — لا تُستبدل أبدًا
       await idbPut('backup-before-v3', { savedAt: new Date().toISOString(), data: plain }).catch(() => {});
     }
-    return { status: 'plain', data: upgrade(plain), migratedFrom: from < SCHEMA ? from : null };
+    return { status: 'plain', data: upgrade(plain), migratedFrom: from < SCHEMA ? from : null, dbOk };
   }
   const legacy = migrateV1(parse(lsGet(K.legacy)));
-  if (legacy) return { status: 'plain', data: upgrade(legacy), migratedFrom: 1 };
-  return { status: 'new' };
+  if (legacy) return { status: 'plain', data: upgrade(legacy), migratedFrom: 1, dbOk };
+  if (lsGet(K.data) !== null || (!dbOk && lsGet('folosi_has_data'))) return { status: 'error', reason: dbOk ? 'data-unreadable' : 'storage-unavailable', dbOk };
+  return { status: 'new', dbOk };
 }
 
+export class LockedElsewhereError extends Error { constructor() { super('locked-elsewhere'); this.name = 'LockedElsewhereError'; } }
+
 // حفظ: يعيد {ok, idb, ls}. في وضع القفل تُحفظ نسخة مشفرة فقط.
+// لا يُحذف مخزن الوضع الآخر إلا عند انتقال مقصود (تفعيل/إيقاف القفل) — حتى لا تُلغي نافذة قديمة القفل.
+// قناة واحدة للإرسال والاستقبال: الرسالة تصل للنوافذ الأخرى فقط، لا لنفس النافذة
+export const channel = (() => { try { return new BroadcastChannel('folosi'); } catch { return null; } })();
 let chain = Promise.resolve();
-export function persist(data, session) {
-  const job = chain.then(() => write(data, session));
+export function persist(data, session, opts = {}) {
+  const job = chain.then(() => write(data, session, opts));
   chain = job.catch(() => {});
   return job;
 }
-async function write(data, session) {
-  let payload, lsKey, idbKey, removeLs, removeIdb;
-  if (session) {
-    payload = await sealVault(session, data);
-    lsKey = K.vault; idbKey = 'vault'; removeLs = K.data; removeIdb = 'latest';
-  } else {
-    payload = data; lsKey = K.data; idbKey = 'latest'; removeLs = K.vault; removeIdb = 'vault';
-  }
+async function write(data, session, { transition = false } = {}) {
+  if (!session && !transition && (await lockFlag())) throw new LockedElsewhereError(); // تم تفعيل القفل من نافذة أخرى
+  const payload = session ? await sealVault(session, data) : data;
+  const lsKey = session ? K.vault : K.data, idbKey = session ? 'vault' : 'latest';
   let idbOk = false;
   const lsOk = lsSet(lsKey, JSON.stringify(payload)); // متزامن أولًا: يبقى حتى لو أُغلق التطبيق فورًا
   try { await idbPut(idbKey, payload); idbOk = true; } catch {}
+  if (session && !lsOk) lsDel(lsKey); // نسخة مرآة مشفرة قديمة لا تبقى إن تعذر تحديثها
   if (idbOk || lsOk) {
-    if (idbOk) await idbDel(removeIdb);
-    if (lsOk || session) lsDel(removeLs); // لا تبقى نسخة غير مشفرة عند تفعيل القفل
-    if (!lsOk) lsDel(lsKey); // نسخة مرآة قديمة قد تكون أحدث خطأً — نزيلها
+    lsSet('folosi_has_data', '1');
+    if (session) { lsDel(K.data); await idbDel('latest'); } // في وضع القفل: لا تبقى نسخة غير مشفرة أبدًا
+    if (transition) {
+      if (session) await setLockFlag(true);
+      else { lsDel(K.vault); await idbDel('vault'); await setLockFlag(false); }
+      try { channel?.postMessage({ type: 'lock-changed' }); } catch {}
+    }
   }
   return { ok: idbOk || lsOk, idb: idbOk, ls: lsOk };
 }

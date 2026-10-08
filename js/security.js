@@ -110,8 +110,8 @@ export async function passkeyAvailable() {
     return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
   } catch { return false; }
 }
-// يسجل مفتاح مرور ويتحقق فعليًا من دعم PRF؛ إن لم يُدعم يعيد خطأ ولا يُفعَّل شيء
-export async function enablePasskey(session) {
+// الخطوة 1: تسجيل مفتاح مرور مع التحقق من دعم PRF. يُستدعى مباشرة من ضغطة المستخدم.
+export async function registerPasskey() {
   const prfSalt = rand(32);
   const cred = await navigator.credentials.create({ publicKey: {
     rp: { name: 'فلوسي', id: location.hostname }, challenge: rand(32),
@@ -121,13 +121,18 @@ export async function enablePasskey(session) {
     timeout: 60000, extensions: { prf: { eval: { first: prfSalt } } } } });
   const ext = cred.getClientExtensionResults?.() || {};
   if (ext.prf?.enabled === false) { const e = new Error('prf-unsupported'); e.code = 'prf'; throw e; }
-  const credId = b64url(cred.rawId);
-  let secret = ext.prf?.results?.first;
-  if (!secret) secret = await prfSecret(credId, prfSalt);
-  const kek = await hkdfKey(new Uint8Array(secret), 'folosi-passkey-v1');
-  session.keys.passkey = { kind: 'passkey', credId, prfSalt: b64(prfSalt), ...(await encryptBytes(kek, session.raw, 'folosi-key')) };
+  return { credId: b64url(cred.rawId), prfSalt, secret: ext.prf?.results?.first || null };
 }
-async function prfSecret(credId, prfSalt) {
+// الخطوة 2: تغليف مفتاح البيانات بسر Face ID (لا يُفعَّل شيء قبل نجاح هذه الخطوة)
+export async function finishPasskey(session, reg, secret) {
+  const kek = await hkdfKey(new Uint8Array(secret), 'folosi-passkey-v1');
+  session.keys.passkey = { kind: 'passkey', credId: reg.credId, prfSalt: b64(reg.prfSalt), ...(await encryptBytes(kek, session.raw, 'folosi-key')) };
+}
+export async function enablePasskey(session) { // للتوافق: تسجيل وتفعيل في خطوة واحدة (المتصفحات المكتبية)
+  const reg = await registerPasskey();
+  await finishPasskey(session, reg, reg.secret || (await passkeySecret(reg.credId, reg.prfSalt)));
+}
+export async function passkeySecret(credId, prfSalt) {
   const a = await navigator.credentials.get({ publicKey: { challenge: rand(32), rpId: location.hostname, timeout: 60000, userVerification: 'required',
     allowCredentials: [{ type: 'public-key', id: unb64url(credId) }], extensions: { prf: { eval: { first: prfSalt } } } } });
   const first = a.getClientExtensionResults?.()?.prf?.results?.first;
@@ -136,7 +141,7 @@ async function prfSecret(credId, prfSalt) {
 }
 export async function openVaultWithPasskey(vault) {
   const w = vault.keys.passkey; if (!w) throw new Error('no-passkey');
-  const secret = await prfSecret(w.credId, unb64(w.prfSalt));
+  const secret = await passkeySecret(w.credId, unb64(w.prfSalt));
   const kek = await hkdfKey(new Uint8Array(secret), 'folosi-passkey-v1');
   const raw = await decryptBytes(kek, w, 'folosi-key');
   return openWithRaw(vault, raw);

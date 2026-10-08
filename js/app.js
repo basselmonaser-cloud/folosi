@@ -103,11 +103,11 @@ document.addEventListener('click', (e) => {
   if (e.target === $('sheet')) closeSheet();
 });
 
-function currencyOptions(selected, { only, short } = {}) {
+function currencyOptions(selected, { only, short, codeFirst } = {}) {
   let all = [];
   try { all = Intl.supportedValuesOf?.('currency') || []; } catch {}
   const common = only || C.COMMON_CURRENCIES;
-  const o = (c) => `<option value="${c}"${c === selected ? ' selected' : ''}>${short ? `${c} ${esc(sym(c) === c ? '' : sym(c))}` : `${esc(curName(c))} (${c})`}</option>`;
+  const o = (c) => `<option value="${c}"${c === selected ? ' selected' : ''}>${short ? `${c} ${esc(sym(c) === c ? '' : sym(c))}` : codeFirst ? `${c} · ${esc(curName(c))}` : `${esc(curName(c))} (${c})`}</option>`;
   return `<optgroup label="شائعة">${common.map(o).join('')}</optgroup>` + (only ? '' : `<optgroup label="عملات أخرى">${all.filter((c) => !common.includes(c)).map(o).join('')}</optgroup>`);
 }
 const accountOptions = (selected, { exclude, all } = {}) => S.data.accounts.filter((a) => (all || !a.archived) && a.id !== exclude)
@@ -120,11 +120,15 @@ function rateHint(from, to) {
 }
 
 // ---------- الحفظ ----------
-async function save() {
+async function save(opts) {
+  if (!S.data || S.locking) return false;
   try {
-    const r = await Store.persist(S.data, S.session);
+    const r = await Store.persist(S.data, S.session, opts);
     S.saveOk = r.ok; S.lastSave = new Date(); S.saveWarn = r.ok && (!r.idb || !r.ls);
-  } catch { S.saveOk = false; }
+  } catch (e) {
+    if (e?.name === 'LockedElsewhereError') { lockNow(); return false; } // فُعّل القفل من نافذة أخرى: لا نحفظ نسخة غير مشفرة
+    S.saveOk = false;
+  }
   renderStatus(); renderBanners();
   if (!S.persistAsked) { S.persistAsked = true; Store.requestPersistence(); }
   return S.saveOk;
@@ -150,7 +154,7 @@ function renderStatus() {
 }
 
 // ---------- التنقل ----------
-const VIEWS = ['home', 'history', 'accounts', 'clients', 'debts', 'goals', 'recurring', 'reports', 'more', 'settings', 'detail'];
+const VIEWS = ['home', 'history', 'accounts', 'clients', 'debts', 'goals', 'recurring', 'reports', 'more', 'settings', 'detail', 'converter'];
 const NAV_OF = { home: 'home', history: 'history', reports: 'reports', detail: 'home' };
 function go(view, param = '') { location.hash = '#/' + view + (param ? '/' + param : ''); }
 function readHash() {
@@ -164,7 +168,7 @@ function render() {
   const nav = NAV_OF[S.view] || 'more';
   document.querySelectorAll('[data-nav]').forEach((b) => (b.dataset.nav === nav ? b.setAttribute('aria-current', 'page') : b.removeAttribute('aria-current')));
   ({ home: renderHome, history: renderHistory, accounts: renderAccounts, clients: renderClients, debts: renderDebts, goals: renderGoals,
-    recurring: renderRecurring, reports: renderReports, more: renderMore, settings: renderSettings, detail: renderDetail })[S.view]();
+    recurring: renderRecurring, reports: renderReports, more: renderMore, settings: renderSettings, detail: renderDetail, converter: renderConverter })[S.view]();
   renderStatus(); renderBanners();
 }
 const head = (title, back = 'more', extra = '') => `<div class="view-head"><button class="back" data-nav-to="${back}" aria-label="رجوع">${icon('i-back')}</button><h2>${esc(title)}</h2>${extra}</div>`;
@@ -190,6 +194,7 @@ const SHORTCUTS = {
   reports: ['i-chart', 'التقارير', () => go('reports')], history: ['i-list', 'السجل', () => go('history')],
   income: ['i-arrow-in', 'دخل', () => openTx({ type: 'income' })], expense: ['i-arrow-out', 'مصروف', () => openTx({ type: 'expense' })],
   settings: ['i-gear', 'الإعدادات', () => go('settings')],
+  converter: ['i-swap', 'محول العملات', () => go('converter')],
 };
 function shortcutList() {
   let s = readJSON(K.shortcuts);
@@ -198,7 +203,9 @@ function shortcutList() {
 }
 function renderHome() {
   const d = S.data, cur = disp();
-  const tot = C.totalBalance(d, S.rates), mm = C.monthRange(C.today().slice(0, 7));
+  const bt = C.balancesByType(d, S.rates), tot = bt, mm = C.monthRange(C.today().slice(0, 7));
+  const SHORT = { cash: 'النقد', bank: 'البنوك', wallet: 'المحافظ', other: 'أخرى' };
+  const groups = bt.groups.filter((g) => g.accounts.length).map((g) => ({ ...g, short: SHORT[g.key] }));
   const sum = C.periodSummary(d, mm, S.rates), ob = C.obligationTotals(d, S.rates);
   const curs = new Set(d.accounts.map((a) => a.currency));
   const sc = shortcutList();
@@ -206,10 +213,11 @@ function renderHome() {
   $('v-home').innerHTML = `
     <div class="row-head"><small>اختصاراتك</small><button class="link-btn" data-action="edit-shortcuts">تخصيص</button></div>
     <div class="shortcuts">${sc.map((k) => `<button class="shortcut" data-shortcut="${k}"><span class="ico">${icon(SHORTCUTS[k][0])}</span><span>${SHORTCUTS[k][1]}</span></button>`).join('') || '<small class="muted">لا توجد اختصارات — اضغط تخصيص</small>'}</div>
-    <div class="card hero">
-      <small>الرصيد الإجمالي</small>
+    <div class="card hero hero-btn" role="button" tabindex="0" data-nav-to="detail/balances" aria-label="تفاصيل الأرصدة">
+      <small>الرصيد الإجمالي — كل الحسابات</small>
       <div class="big"><span class="num">${tot.total < 0 ? '-' : ''}${nf(cur).format(Math.abs(tot.total))}</span><span class="cur">${esc(sym(cur))}</span></div>
-      <small>${countLabel(d.accounts.filter((a) => !a.archived).length)}${curs.size > 1 ? ` · ${curs.size} عملات محوّلة إلى ${esc(curName(cur))} بالسعر الحالي` : ''}</small>
+      <div class="hero-groups">${groups.map((g) => `<span><small>${esc(g.short)}</small><b class="num">${g.total < 0 ? '-' : ''}${nf(cur).format(Math.abs(g.total))}</b></span>`).join('')}</div>
+      <small>${countLabel(d.accounts.filter((a) => !a.archived).length)}${curs.size > 1 ? ` · ${curs.size} عملات محوّلة إلى ${esc(curName(cur))} بالسعر الحالي` : ''} · اضغط للتفاصيل</small>
     </div>
     ${missingNote(tot.missing)}
     <div class="stats">
@@ -302,6 +310,15 @@ function renderDetail() {
       ${prj.length ? `<div class="card"><h3>العملاء والمشاريع</h3><ul class="list">${prj.map(projectRow).join('')}</ul></div>` : ''}
       <div class="card"><h3>${kind === 'receivable' ? 'ديون لي على الآخرين' : 'ديون عليّ للآخرين'}</h3>${obs.length ? `<ul class="list">${obs.map(obRow).join('')}</ul>` : '<div class="empty">لا يوجد</div>'}
       <button class="btn block" data-action="add-ob" data-type="${kind}">إضافة ${kind === 'receivable' ? 'مستحق' : 'دين'}</button></div>`;
+  } else if (kind === 'balances') {
+    const bt = C.balancesByType(S.data, S.rates);
+    $('v-detail').innerHTML = `${head('تفاصيل الأرصدة', 'home')}
+      <div class="card"><small>الإجمالي بعملة العرض (${esc(curName(cur))})</small><div style="font-size:28px;font-weight:700">${money(bt.total, cur)}</div>
+        <p class="hint">التحويل بين حساباتك ينقل المال فقط ولا يغيّر الإجمالي ولا يُحتسب دخلًا أو مصروفًا. الحسابات بعملات أخرى محوّلة بالسعر الحالي${S.rates.fetchedAt ? ` (${esc(dt(S.rates.fetchedAt))})` : ''}.</p>${missingNote(bt.missing)}</div>
+      ${bt.groups.filter((g) => g.accounts.length).map((g) => `<div class="card"><div class="card-head"><h3>${esc(g.label)}</h3><b>${money(g.total, cur)}</b></div>
+        ${Object.keys(g.byCurrency).length > 1 || Object.keys(g.byCurrency)[0] !== cur ? `<p class="hint">بالعملات الأصلية: ${Object.entries(g.byCurrency).map(([c, v]) => esc(plain(v, c))).join(' + ')}</p>` : ''}
+        <ul class="list">${g.accounts.map((a) => `<li><button class="item" data-action="open-account" data-id="${esc(a.id)}"><div class="body"><div class="title">${esc(a.name)} ${a.archived ? '<span class="tag">مؤرشف</span>' : ''}</div><div class="sub">${esc(C.ACCOUNT_TYPES[a.type] || '')} · ${esc(a.currency)}</div></div><div class="amt">${money(a.balance, a.currency)}${a.currency !== cur ? `<small>${a.converted === null ? 'لا يوجد سعر صرف' : '≈ ' + plain(a.converted, cur)}</small>` : ''}</div></button></li>`).join('')}</ul></div>`).join('') || '<div class="card"><div class="empty">لا توجد حسابات</div></div>'}
+      <button class="btn block" data-nav-to="accounts">إدارة الحسابات</button>`;
   } else go('home');
 }
 
@@ -407,7 +424,13 @@ function openAccount(id) {
     <div class="hint">${a ? `الرصيد الحالي ${plain(C.balance(S.data, a), a.currency)} = الافتتاحي + العمليات والتحويلات.` : 'اكتب الرصيد الموجود فعليًا في الحساب الآن. للسالب اكتب علامة - قبل الرقم.'}${inUse ? ' لا يمكن تغيير عملة حساب عليه عمليات.' : ''}</div>
     ${a ? `<div class="actions"><button type="button" class="btn small" data-action="archive-account" data-id="${esc(a.id)}">${a.archived ? 'إلغاء الأرشفة' : 'أرشفة'}</button>${inUse ? '' : `<button type="button" class="btn small ghost-danger" data-action="del-account" data-id="${esc(a.id)}">حذف الحساب</button>`}<button type="button" class="btn small" data-action="account-history" data-id="${esc(a.id)}">عمليات الحساب</button></div>` : ''}`, {
     submit: a ? 'حفظ' : 'إضافة الحساب',
-    onReady: (body, form) => body.querySelectorAll('[data-preset]').forEach((b) => (b.onclick = () => { form.elements.name.value = b.dataset.preset; form.elements.type.value = b.dataset.ptype; })),
+    onReady: (body, form) => {
+      body.querySelectorAll('[data-preset]').forEach((b) => (b.onclick = () => { form.elements.name.value = b.dataset.preset; form.elements.type.value = b.dataset.ptype; form.dataset.typeTouched = '1'; }));
+      if (a) return;
+      // نوع الحساب يتبع الاسم تلقائيًا (كاش ← نقد، STC/برق/محفظة ← محفظة) ما لم يختره المستخدم بنفسه
+      form.elements.type.addEventListener('change', () => (form.dataset.typeTouched = '1'));
+      form.elements.name.addEventListener('input', () => { if (form.dataset.typeTouched) return; const t = C.guessAccountType(form.elements.name.value); if (t) form.elements.type.value = t; });
+    },
     onSubmit: (v) => commit((d) => (a ? C.updateAccount(d, a.id, { ...v, currency: inUse ? undefined : v.currency }) : C.addAccount(d, v)), a ? 'تم حفظ الحساب' : 'تمت إضافة الحساب'),
   });
 }
@@ -691,9 +714,80 @@ function renderReports() {
   $('repYear') && ($('repYear').onchange = (e) => { S.rep.year = e.target.value; renderReports(); });
 }
 
+// ---------- محول العملات ----------
+function convState() {
+  const saved = readJSON('folosi_converter_v1') || {};
+  return { amount: saved.amount ?? '100', from: saved.from || 'USD', to: saved.to || (disp() === 'USD' ? 'SAR' : disp()) };
+}
+function renderConverter() {
+  const st = S.conv || (S.conv = convState());
+  const r = S.rates, stale = FX.isStale(r, 24), y = r.yer || {};
+  const yerInvolved = st.from === 'YER' || st.to === 'YER';
+  $('v-converter').innerHTML = `${head('محول العملات', 'more')}
+    <div class="card">
+      <label for="cvAmount">المبلغ</label><input id="cvAmount" class="amount-input" inputmode="decimal" value="${esc(st.amount)}" autocomplete="off">
+      <div class="conv-row"><div><label for="cvFrom">من</label><select id="cvFrom">${currencyOptions(st.from, { codeFirst: true })}</select></div>
+        <button type="button" class="btn swap-btn" id="cvSwap" aria-label="تبديل العملتين">⇅</button>
+        <div><label for="cvTo">إلى</label><select id="cvTo">${currencyOptions(st.to, { codeFirst: true })}</select></div></div>
+      ${yerInvolved ? `<label>سعر الريال اليمني المستخدم</label><div class="seg" id="cvYer">${[['auto', 'آلي'], ['sanaa', 'صنعاء'], ['aden', 'عدن']].map(([k, l]) => `<button type="button" data-yer="${k}" aria-pressed="${(y.active || 'auto') === k}">${l}${k !== 'auto' && y[k]?.value ? ` <small>${esc(y[k].value)}</small>` : ''}</button>`).join('')}</div>
+        <p class="hint"><button type="button" class="link-btn" data-action="yer-markets">تعديل أسعار صنعاء وعدن</button></p>` : ''}
+      <div class="conv-result" id="cvOut" aria-live="polite"></div>
+    </div>
+    <div class="card"><h3>مصدر السعر</h3><div id="cvSource" class="muted" style="font-size:14px;line-height:1.8"></div>
+      <div class="actions"><button class="btn small" data-action="refresh-rates">تحديث الأسعار الآن</button><button class="btn small" id="cvManual">سعر يدوي</button></div></div>`;
+  const out = () => {
+    const amount = $('cvAmount').value, from = $('cvFrom').value, to = $('cvTo').value;
+    S.conv = { amount, from, to }; Store.lsSet('folosi_converter_v1', JSON.stringify(S.conv));
+    const c = C.convertDetail(amount, from, to, S.rates);
+    if (!c.ok) {
+      $('cvOut').innerHTML = c.reason === 'amount' ? '<p class="bad">اكتب مبلغًا صحيحًا</p>' : `<p class="bad">لا يتوفر سعر صرف لـ ${c.missing.map(esc).join('، ')}.</p><p class="hint">لا نعرض أسعارًا تقديرية. حدّث الأسعار عند توفر الإنترنت أو أدخل سعرًا يدويًا.</p>`;
+    } else {
+      $('cvOut').innerHTML = `<div class="conv-big">${money(c.result, to)}</div>
+        <p class="hint">السعر المستخدم: <bdi dir="ltr">1 ${esc(from)} = ${+c.rate.toPrecision(8)} ${esc(to)}</bdi>${c.inverse ? ` · <bdi dir="ltr">1 ${esc(to)} = ${+c.inverse.toPrecision(8)} ${esc(from)}</bdi>` : ''}${c.manual ? ' · <b>سعر يدوي</b>' : ''}</p>`;
+    }
+    const manualOf = (code) => r.manual?.[code];
+    const lines = [];
+    if (r.fetchedAt) lines.push(`المصدر الآلي: <a href="${esc(FX.SOURCE_LINKS[r.source] || '#')}" target="_blank" rel="noopener noreferrer">${esc(r.sourceName || r.source)}</a>`, `تاريخ السعر: ${esc(r.publishedAt ? dt(r.publishedAt) : '—')} · آخر جلب: ${esc(dt(r.fetchedAt))}`);
+    else lines.push('لم تُجلب أسعار آلية بعد على هذا الجهاز.');
+    for (const code of [from, to]) { const m = manualOf(code); if (m) lines.push(`سعر يدوي لـ ${esc(code)}${m.label ? ` (${m.label === 'sanaa' ? 'صنعاء' : m.label === 'aden' ? 'عدن' : esc(m.label)})` : ''}: 1 ${esc(m.ref)} = ${esc(m.value)} ${esc(code)} · ${esc(m.at ? dt(m.at) : '')}`); }
+    if (r.fetchedAt && (stale || !navigator.onLine)) lines.push(`<span class="tag warn">سعر قديم</span> ${!navigator.onLine ? 'لا يوجد اتصال — ' : ''}نستخدم آخر سعر محفوظ وقد لا يطابق السوق الآن.`);
+    $('cvSource').innerHTML = lines.join('<br>');
+  };
+  $('cvAmount').oninput = out; $('cvFrom').onchange = () => { renderConverterKeep(); }; $('cvTo').onchange = () => { renderConverterKeep(); };
+  const renderConverterKeep = () => { S.conv = { amount: $('cvAmount').value, from: $('cvFrom').value, to: $('cvTo').value }; Store.lsSet('folosi_converter_v1', JSON.stringify(S.conv)); renderConverter(); };
+  $('cvSwap').onclick = () => { S.conv = { amount: $('cvAmount').value, from: $('cvTo').value, to: $('cvFrom').value }; Store.lsSet('folosi_converter_v1', JSON.stringify(S.conv)); renderConverter(); };
+  $('cvManual').onclick = () => openManualRate($('cvFrom').value === disp() ? $('cvTo').value : $('cvFrom').value);
+  $('cvYer')?.addEventListener('click', (e) => {
+    const k = e.target.closest('[data-yer]')?.dataset.yer; if (!k) return;
+    if (k !== 'auto' && !(S.rates.yer?.[k]?.value > 0)) return openYerMarkets(k);
+    S.rates = C.withYerMarket(S.rates, k); FX.saveRates(S.rates); renderConverter();
+  });
+  out();
+}
+function openYerMarkets(focus) {
+  const y = S.rates.yer || {};
+  sheet('سعر الريال اليمني', `<p class="muted" style="font-size:14px">يختلف سعر الريال اليمني بين صنعاء وعدن، والمصادر الآلية قد تعرض سعرًا رسميًا لا يطابق السوق. أدخل السعر الذي تتعامل به (اترك الحقل فارغًا إن لم تستخدمه).</p>
+    <label for="ySanaa">صنعاء: 1 ريال سعودي = ؟ ريال يمني</label><input id="ySanaa" name="sanaa" inputmode="decimal" value="${esc(y.sanaa?.value || '')}">
+    <label for="yAden">عدن: 1 ريال سعودي = ؟ ريال يمني</label><input id="yAden" name="aden" inputmode="decimal" value="${esc(y.aden?.value || '')}">
+    <label>السعر المستخدم في التطبيق</label><select name="active">${[['auto', 'السعر الآلي من الإنترنت'], ['sanaa', 'سعر صنعاء'], ['aden', 'سعر عدن']].map(([k, l]) => `<option value="${k}"${(focus || y.active || 'auto') === k ? ' selected' : ''}>${l}</option>`).join('')}</select>
+    <p class="hint">يُطبّق السعر المختار على الإجماليات والتقارير ومحول العملات.</p>`, {
+    onReady: () => focus && $(focus === 'sanaa' ? 'ySanaa' : 'yAden')?.focus(),
+    onSubmit: (v) => {
+      const yer = { ...(S.rates.yer || {}) };
+      for (const k of ['sanaa', 'aden']) {
+        if (v[k] === '') { delete yer[k]; continue; }
+        const n = C.parseAmount(v[k]); if (!(n > 0)) throw new C.ValidationError('أدخل سعرًا صحيحًا أكبر من صفر');
+        yer[k] = { ref: 'SAR', value: n, at: new Date().toISOString() };
+      }
+      if (v.active !== 'auto' && !yer[v.active]) throw new C.ValidationError('أدخل سعر السوق المختار أولًا');
+      S.rates = C.withYerMarket({ ...S.rates, yer }, v.active); FX.saveRates(S.rates); render(); toast('تم حفظ أسعار الريال اليمني');
+    },
+  });
+}
+
 // ---------- المزيد ----------
 function renderMore() {
-  const items = [['accounts', 'i-wallet', 'الحسابات'], ['clients', 'i-users', 'العملاء والمشاريع'], ['debts', 'i-hand', 'الديون'], ['goals', 'i-target', 'الادخار'], ['recurring', 'i-bill', 'الفواتير المتكررة'], ['history', 'i-list', 'سجل العمليات'], ['reports', 'i-chart', 'التقارير'], ['settings', 'i-gear', 'الإعدادات']];
+  const items = [['accounts', 'i-wallet', 'الحسابات'], ['clients', 'i-users', 'العملاء والمشاريع'], ['debts', 'i-hand', 'الديون'], ['goals', 'i-target', 'الادخار'], ['recurring', 'i-bill', 'الفواتير المتكررة'], ['history', 'i-list', 'سجل العمليات'], ['reports', 'i-chart', 'التقارير'], ['converter', 'i-swap', 'محول العملات'], ['settings', 'i-gear', 'الإعدادات']];
   $('v-more').innerHTML = `<div class="view-head"><h2>المزيد</h2></div><div class="more-grid">${items.map(([v, i, l]) => `<button class="shortcut" data-nav-to="${v}"><span class="ico">${icon(i)}</span><span>${l}</span></button>`).join('')}
     <button class="shortcut" data-action="transfer"><span class="ico">${icon('i-swap')}</span><span>تحويل بين الحسابات</span></button></div>`;
 }
@@ -716,12 +810,13 @@ function renderSettings() {
     <div class="card"><h3>العملة وأسعار الصرف</h3><label for="curSel">عملة العرض الأساسية</label><select id="curSel">${currencyOptions(cur)}</select>
       <p class="hint">تُعرض الإجماليات والتقارير بهذه العملة. كل عملية تحتفظ بمبلغها وعملتها الأصليين.</p>
       <p class="muted" style="font-size:14px">${S.rates.fetchedAt ? `المصدر: <a href="${esc(FX.SOURCE_LINKS[S.rates.source] || '#')}" target="_blank" rel="noopener noreferrer">${esc(S.rates.sourceName)}</a><br>نشر السعر: ${esc(S.rates.publishedAt ? dt(S.rates.publishedAt) : '—')} · آخر جلب: ${esc(dt(S.rates.fetchedAt))}` : 'لم تُجلب أسعار صرف بعد.'}</p>
-      <div class="actions"><button class="btn small" data-action="refresh-rates">تحديث الأسعار الآن</button><button class="btn small" data-action="manual-rate" data-cur="${cur === 'YER' ? 'SAR' : 'YER'}">إدخال سعر يدوي</button></div>
+      <div class="actions"><button class="btn small primary" data-nav-to="converter">محول العملات</button><button class="btn small" data-action="yer-markets">سعر الريال اليمني (صنعاء/عدن)</button><button class="btn small" data-action="refresh-rates">تحديث الأسعار الآن</button><button class="btn small" data-action="manual-rate" data-cur="${cur === 'YER' ? 'SAR' : 'YER'}">إدخال سعر يدوي</button></div>
       ${rateRows ? `<ul class="list" style="margin-top:8px">${rateRows}</ul>` : ''}
       <div class="notice" style="font-size:13px">سعر الريال اليمني يختلف كثيرًا بين الأسواق (صنعاء/عدن)، والمصادر الآلية قد تعرض سعرًا رسميًا لا يطابق السوق. يُنصح بإدخال السعر اليدوي الذي تتعامل به.</div></div>
 
     <div class="card"><h3>القفل وحماية البيانات</h3>
       ${lock ? `<p class="good" style="font-weight:500">مفعّل · بياناتك على هذا الجهاز مشفرة (AES-256)</p>
+        <label for="lockGrace">عند مغادرة التطبيق أو إغلاقه</label><select id="lockGrace">${[[0, 'اقفل فورًا (موصى به)'], [1, 'بعد دقيقة'], [5, 'بعد 5 دقائق']].map(([v, l]) => `<option value="${v}"${(d.settings.lockGrace ?? 0) === v ? ' selected' : ''}>${l}</option>`).join('')}</select>
         <label for="autoLock">القفل التلقائي بعد عدم الاستخدام</label><select id="autoLock">${[[1, 'دقيقة'], [5, '5 دقائق'], [15, '15 دقيقة'], [60, 'ساعة']].map(([v, l]) => `<option value="${v}"${autoLock === v ? ' selected' : ''}>${l}</option>`).join('')}</select>
         <div class="actions"><button class="btn small" data-action="lock-now">قفل الآن</button><button class="btn small" data-action="change-secret">تغيير ${keys.pin?.kind === 'password' ? 'كلمة المرور' : 'الرمز'}</button><button class="btn small" data-action="new-recovery">مفتاح استرداد جديد</button>
         ${keys.passkey ? `<button class="btn small" data-action="passkey-off">إيقاف Face ID</button>` : S.passkeyOK ? `<button class="btn small" data-action="passkey-on">تفعيل Face ID (تجريبي)</button>` : ''}
@@ -756,6 +851,7 @@ function renderSettings() {
   $('themeSel').value = theme;
   $('themeSel').onchange = (e) => applyTheme(e.target.value);
   $('curSel').onchange = (e) => commit((dd) => { dd.settings.displayCurrency = e.target.value; }, 'تم تغيير عملة العرض');
+  $('lockGrace') && ($('lockGrace').onchange = (e) => commit((dd) => { dd.settings.lockGrace = Number(e.target.value); }, 'تم'));
   $('autoLock') && ($('autoLock').onchange = (e) => commit((dd) => { dd.settings.autoLock = Number(e.target.value); }, 'تم'));
   $('importFile').onchange = (e) => { const f = e.target.files[0]; e.target.value = ''; if (f) importFile(f); };
   $('driveAuto') && ($('driveAuto').onchange = (e) => { S.drive.auto = e.target.checked; saveDriveSettings(); toast(e.target.checked ? 'تم تفعيل النسخ التلقائي' : 'تم إيقاف النسخ التلقائي'); if (e.target.checked) scheduleDrive(true); });
@@ -875,24 +971,34 @@ async function undoRestore() {
   if (!data) return;
   S.data = C.upgrade(data); S.data.updatedAt = new Date().toISOString(); await save(); await Store.setMeta('pre-restore', null); S.hasPreRestore = false; render(); toast('تم التراجع');
 }
-function askSecretOnce(title = 'أدخل رمز القفل الحالي') {
+// التحقق من صاحب الجهاز قبل الإجراءات الحساسة: بالرمز الحالي، أو Face ID، أو مفتاح الاسترداد.
+// تُختم الخزنة مسبقًا حتى يُستدعى Face ID مباشرة داخل ضغطة المستخدم (شرط Safari على الآيفون).
+async function verifyCurrent(title = 'تأكيد هويتك') {
+  const v = await Sec.sealVault(S.session, S.data);
+  const pk = !!S.session?.keys.passkey, kind = S.session?.keys.pin?.kind;
   return new Promise((resolve, reject) => {
     let done = false;
-    const pk = !!S.session?.keys.passkey;
-    sheet(title, `<input type="password" name="s" inputmode="${S.session?.keys.pin?.kind === 'pin' ? 'numeric' : 'text'}" autocomplete="current-password" ${pk ? '' : 'required'}>${pk ? '<button type="button" class="btn block" id="askPk" style="margin-top:10px">التحقق بـ Face ID بدلًا من الرمز</button>' : ''}`, { submit: 'متابعة', onSubmit: (v) => { done = true; resolve(v.s); } });
-    if (pk) $('askPk').onclick = () => { done = true; resolve(PASSKEY); closeSheet(); };
+    const finish = () => { done = true; closeSheet(); resolve(); };
+    sheet(title, `<label for="vSecret">${kind === 'password' ? 'كلمة المرور الحالية' : 'الرمز الحالي'}</label><input id="vSecret" type="password" name="s" inputmode="${kind === 'pin' ? 'numeric' : 'text'}" autocomplete="current-password">
+      ${pk ? '<button type="button" class="btn block" id="askPk" style="margin-top:10px">التحقق بـ Face ID</button>' : ''}
+      <button type="button" class="link-btn" id="askRec" style="margin-top:8px">نسيت الرمز؟ استخدم مفتاح الاسترداد</button>
+      <div id="recBox" hidden><label for="vRec">مفتاح الاسترداد</label><input id="vRec" name="rec" dir="ltr" autocapitalize="characters" placeholder="XXXX-XXXX-XXXX-XXXX-XXXX"></div>`, {
+      submit: 'متابعة',
+      onSubmit: async (val) => {
+        const viaRec = !$('recBox').hidden && val.rec;
+        try {
+          if (viaRec) await Sec.openVaultWithSecret(v, val.rec, 'recovery');
+          else { if (!val.s) throw new C.ValidationError('أدخل الرمز'); await Sec.openVaultWithSecret(v, val.s); }
+        } catch (e) { if (e instanceof C.ValidationError) throw e; throw new C.ValidationError(viaRec ? 'مفتاح الاسترداد غير صحيح' : 'الرمز غير صحيح'); }
+        done = true; resolve();
+      },
+    });
+    $('askRec').onclick = () => { $('recBox').hidden = false; $('vRec').focus(); };
+    if (pk) $('askPk').onclick = () => { Sec.openVaultWithPasskey(v).then(finish, (e) => { $('sfErr').textContent = e?.name === 'NotAllowedError' ? 'تم إلغاء Face ID' : 'تعذر التحقق بـ Face ID'; }); };
     $('sheet').addEventListener('close', () => { if (!done) reject(new Error('cancel')); }, { once: true });
   });
 }
-const PASSKEY = Symbol('passkey');
 
-// ---------- القفل ----------
-// التحقق من صاحب الجهاز قبل الإجراءات الحساسة: بالرمز الحالي أو Face ID (مفيد لمن نسي رمزه)
-async function verifyCurrent() {
-  const s = await askSecretOnce();
-  const v = await Sec.sealVault(S.session, S.data);
-  if (s === PASSKEY) await Sec.openVaultWithPasskey(v); else await Sec.openVaultWithSecret(v, s); // يرمي خطأ إن كان خاطئًا
-}
 function openLockSetup(change = false) {
   sheet(change ? 'تغيير رمز القفل' : 'تفعيل القفل والتشفير', `
     <div class="seg">${pick('kind', 'pin', 'رمز أرقام (6+)')}${pick('kind', 'password', 'كلمة مرور (أقوى)')}</div><input type="hidden" name="kind" value="pin">
@@ -908,7 +1014,9 @@ function openLockSetup(change = false) {
       btn.textContent = 'جارٍ التشفير…';
       if (change) { await Sec.changeSecret(S.session, v.s1, v.kind); S.recoveredNeedsPin = false; await save(); toast('تم تغيير الرمز'); render(); return; }
       const { session, recovery } = await Sec.createVault(S.data, { secret: v.s1, kind: v.kind });
-      S.session = session; await save(); await Store.syncSideStores(null, session); render(); showRecovery(recovery, true); return false;
+      S.session = session;
+      if (!(await save({ transition: true }))) { S.session = null; throw new C.ValidationError('تعذر حفظ الخزنة المشفرة — لم يُفعّل القفل. لم تتغير بياناتك.'); }
+      await Store.syncSideStores(null, session); render(); showRecovery(recovery, true); return false;
     },
   });
 }
@@ -927,7 +1035,19 @@ function showRecovery(code, first = false) {
     if (first && await confirmBox({ title: 'نسخة احتياطية الآن؟', text: 'يُنصح بتنزيل نسخة احتياطية مشفرة بكلمة مرور منفصلة. تحميك إذا ضاع الجوال أو نسيت الرمز والمفتاح معًا.', ok: 'تنزيل نسخة', cancel: 'لاحقًا' })) exportEncrypted();
   };
 }
-async function lockNow() { await Store.persist(S.data, S.session).catch(() => {}); location.reload(); }
+// ---------- سياسة القفل ----------
+// القفل = حفظ آخر نسخة مشفرة، ثم مسح البيانات والمفتاح من الذاكرة، ثم إعادة تحميل الصفحة إلى شاشة القفل.
+// لا تبقى أي بيانات مفكوكة في الذاكرة بعد القفل، فالحماية ليست مجرد إخفاء للواجهة.
+function cover(on) { document.documentElement.classList.toggle('privacy-cover', !!on); }
+function lockNow() {
+  if (S.locking) return;
+  S.locking = true; cover(true); $('app').hidden = true;
+  const data = S.data, session = S.session;
+  closeSheet(); S.data = null; S.session = null;
+  const done = () => location.reload();
+  (data && session ? Store.persist(data, session) : Promise.resolve()).then(done, done);
+}
+const graceMinutes = () => S.data?.settings.lockGrace ?? 0; // افتراضيًا: قفل فوري عند مغادرة التطبيق
 function idleCheck() {
   if (!S.session || !S.data) return;
   const mins = S.data.settings.autoLock ?? 5;
@@ -935,11 +1055,22 @@ function idleCheck() {
 }
 ['pointerdown', 'keydown', 'scroll'].forEach((ev) => addEventListener(ev, () => (S.lastActivity = Date.now()), { passive: true }));
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { S.hiddenAt = Date.now(); return; }
-  if (S.session && S.hiddenAt && Date.now() - S.hiddenAt > (S.data?.settings.autoLock ?? 5) * 60e3) return lockNow();
+  if (document.hidden) {
+    S.hiddenAt = Date.now();
+    if (S.session) { cover(true); if (graceMinutes() === 0) lockNow(); } // يخفي الأرقام من لقطة مبدّل التطبيقات
+    return;
+  }
+  if (S.session || S.locking) {
+    if (S.locking || Date.now() - S.hiddenAt >= graceMinutes() * 60e3) return lockNow();
+    cover(false);
+  }
   S.reg?.update().catch(() => {});
   if (S.data && FX.isStale(S.rates, 12)) refreshRates(false);
 });
+addEventListener('pagehide', () => { if (S.session) { cover(true); if (graceMinutes() === 0) lockNow(); } });
+// عودة الصفحة من ذاكرة المتصفح (bfcache) دون إعادة تشغيل: أعد التحقق دائمًا
+addEventListener('pageshow', (e) => { if (e.persisted) Store.lockFlag().then((f) => { if (f || S.locking) location.reload(); }); });
+try { Store.channel.onmessage = (e) => { if (e.data?.type === 'lock-changed') { if (S.session) lockNow(); else location.reload(); } }; } catch {}
 setInterval(idleCheck, 15000);
 
 function lockScreen(vault, mode = 'secret') {
@@ -972,6 +1103,16 @@ function lockScreen(vault, mode = 'secret') {
   $('pkGo') && ($('pkGo').onclick = () => tryUnlock(vault, () => Sec.openVaultWithPasskey(vault), false, null, true));
   $('forgot').onclick = () => lockScreen(vault, 'recovery');
   $('wipeLocked').onclick = () => confirmWipe();
+}
+const faceIdError = (err) => toast(err?.code === 'prf' ? 'جهازك أو متصفحك لا يدعم فتح فلوسي المشفر بـ Face ID (يتطلب iOS 18+). لم يُفعّل شيء.' : err?.name === 'NotAllowedError' ? 'تم الإلغاء' : 'تعذر تفعيل Face ID', true);
+// خطوتان: التسجيل، ثم (إن لم يُرجع Safari السر مباشرة) ضغطة ثانية للتأكيد — Safari يشترط ضغطة مستخدم لكل طلب Face ID
+async function enableFaceId() {
+  let reg;
+  try { reg = await Sec.registerPasskey(); } catch (err) { return faceIdError(err); }
+  const finish = async (secret) => { await Sec.finishPasskey(S.session, reg, secret); if (await save()) { render(); toast('تم تفعيل Face ID — جرّبه بقفل التطبيق'); } };
+  if (reg.secret) return finish(reg.secret).catch(faceIdError);
+  sheet('أكمل تفعيل Face ID', '<p class="muted">خطوة أخيرة: اضغط الزر وأكّد بـ Face ID مرة أخرى لربطه بتشفير بياناتك.</p><button class="btn primary block" id="pkFinish">تأكيد بـ Face ID</button>');
+  $('pkFinish').onclick = () => { Sec.passkeySecret(reg.credId, reg.prfSalt).then((sec) => { closeSheet(); return finish(sec); }).catch((e) => { closeSheet(); faceIdError(e); }); };
 }
 async function tryUnlock(vault, fn, viaRecovery, onFail, viaPasskey) {
   const st = readJSON(K.lockState) || { fails: 0, until: 0 };
@@ -1142,6 +1283,7 @@ document.addEventListener('click', async (e) => {
       case 'manual-rate': return openManualRate(b.dataset.cur);
       case 'clear-rate': { const m = { ...S.rates.manual }; delete m[b.dataset.cur]; S.rates.manual = m; FX.saveRates(S.rates); closeSheet(); render(); return toast('تم حذف السعر اليدوي'); }
       case 'refresh-rates': return refreshRates(true);
+      case 'yer-markets': return openYerMarkets();
       case 'export-json': if (S.session && !(await confirmBox({ title: 'نسخة غير مشفرة', text: 'هذا الملف يمكن لأي شخص قراءته. يفضل النسخة المشفرة. هل تريد المتابعة؟', ok: 'تنزيل' }))) return; return exportPlain();
       case 'export-enc': return exportEncrypted();
       case 'export-csv': download(`folosi-${C.today()}.csv`, C.toCSV(S.data), 'text/csv;charset=utf-8'); return;
@@ -1151,13 +1293,15 @@ document.addEventListener('click', async (e) => {
       case 'check-update': return checkUpdate(true);
       case 'dismiss-migration': Store.lsSet('folosi_v3_migrated_notice', '1'); return renderBanners();
       case 'lock-on': return openLockSetup();
-      case 'change-secret': if (!S.recoveredNeedsPin) { try { await verifyCurrent(); } catch (err) { if (err?.message !== 'cancel') toast('الرمز غير صحيح', true); return; } } return openLockSetup(true);
-      case 'new-recovery': { try { await verifyCurrent(); } catch (err) { if (err?.message !== 'cancel') toast('الرمز غير صحيح', true); return; } const code = await Sec.regenerateRecovery(S.session); await save(); return showRecovery(code); }
-      case 'lock-off': { try { await verifyCurrent(); } catch (err) { if (err?.message !== 'cancel') toast('الرمز غير صحيح', true); return; }
+      case 'change-secret': if (!S.recoveredNeedsPin) { try { await verifyCurrent(); } catch { return; } } return openLockSetup(true);
+      case 'new-recovery': { try { await verifyCurrent(); } catch { return; } const code = await Sec.regenerateRecovery(S.session); await save(); return showRecovery(code); }
+      case 'lock-off': { try { await verifyCurrent(); } catch { return; }
         if (!(await confirmBox({ title: 'إيقاف القفل؟', text: 'ستُحفظ بياناتك على الجهاز دون تشفير.', ok: 'إيقاف', danger: true }))) return;
-        const prev = S.session; S.session = null; await save(); await Store.syncSideStores(prev, null); render(); return toast('تم إيقاف القفل'); }
+        const prev = S.session; S.session = null;
+        if (!(await save({ transition: true }))) { S.session = prev; return toast('تعذر إيقاف القفل — بقي مفعّلًا', true); }
+        await Store.syncSideStores(prev, null); render(); return toast('تم إيقاف القفل'); }
       case 'lock-now': return lockNow();
-      case 'passkey-on': try { toast('اتبع تعليمات Face ID…'); await Sec.enablePasskey(S.session); await save(); render(); toast('تم تفعيل Face ID'); } catch (err) { toast(err.code === 'prf' ? 'جهازك أو متصفحك لا يدعم فتح فلوسي المشفر بـ Face ID (يتطلب iOS 18+). لم يُفعّل شيء.' : err?.name === 'NotAllowedError' ? 'تم الإلغاء' : 'تعذر تفعيل Face ID', true); } return;
+      case 'passkey-on': return enableFaceId();
       case 'passkey-off': delete S.session.keys.passkey; await save(); render(); return toast('تم إيقاف Face ID. يمكنك حذف مفتاح المرور «قفل فلوسي» من تطبيق كلمات المرور.');
       case 'wipe': return confirmWipe();
       case 'drive-connect': return driveConnect();
@@ -1218,6 +1362,23 @@ addEventListener('online', () => { netStatus(); if (S.data && FX.isStale(S.rates
 addEventListener('offline', netStatus);
 
 // ---------- التشغيل ----------
+// حالة خطأ آمنة: لا تُفتح البيانات ولا يُنشأ ملف جديد ولا يُحذف شيء تلقائيًا
+function errorScreen(r) {
+  const el = $('lock'); $('app').hidden = true; el.hidden = false;
+  const msg = r.reason === 'vault-missing' ? 'القفل مفعّل لكن تعذر قراءة الخزنة المشفرة على هذا الجهاز.' : r.reason === 'storage-unavailable' ? 'تعذر الوصول إلى تخزين الجهاز الآن.' : 'تعذر قراءة بيانات فلوسي على هذا الجهاز.';
+  el.innerHTML = `<div class="box"><img src="./icons/icon-192.png" alt=""><h2>لم يُفتح التطبيق لحمايتك</h2><p class="muted" style="line-height:1.8">${msg} لم يُحذف أي شيء، ولن يفتح فلوسي دون مصادقة.</p>
+    <button class="btn primary block" id="eRetry">إعادة المحاولة</button>
+    <button class="btn block" id="eDump" style="margin-top:8px">تنزيل نسخة من الملفات المخزنة (للدعم)</button>
+    <p class="hint" style="margin-top:14px">إن تكرر الخطأ: احذف البيانات ثم استعد نسختك الاحتياطية من الإعدادات.</p>
+    <button class="link-btn" id="eWipe" style="color:var(--bad)">حذف البيانات والبدء من جديد</button></div>`;
+  $('eRetry').onclick = () => location.reload();
+  $('eDump').onclick = async () => {
+    const dump = { app: 'folosi', kind: 'raw-storage', at: new Date().toISOString(), localStorage: {}, vault: await Store.idbGet('vault').catch(() => null) };
+    try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k.startsWith('folosi')) dump.localStorage[k] = localStorage.getItem(k); } } catch {}
+    download(`folosi-raw-${C.today()}.json`, JSON.stringify(dump), 'application/json');
+  };
+  $('eWipe').onclick = () => confirmWipe();
+}
 function start(data) {
   S.data = data;
   if (!S.data.settings) S.data.settings = { displayCurrency: 'SAR' };
@@ -1234,10 +1395,10 @@ async function boot() {
   Sec.passkeyAvailable().then((v) => { S.passkeyOK = v; if (S.view === 'settings' && S.data) renderSettings(); });
   registerSW();
   let r;
-  try { r = await Store.loadInitial(); } catch { r = { status: 'error' }; }
+  try { r = await Store.loadInitial(); } catch { r = { status: 'error', reason: 'exception' }; }
   if (r.status === 'locked') return lockScreen(r.vault);
   if (r.status === 'plain') { S.migratedFrom = r.migratedFrom; return start(r.data); }
-  if (r.status === 'error') { document.body.insertAdjacentHTML('afterbegin', '<div class="notice err">تعذر قراءة التخزين المحلي. لم يُحذف شيء — أعد فتح التطبيق، وإن تكرر الخطأ تواصل مع الدعم.</div>'); return; }
+  if (r.status === 'error') return errorScreen(r);
   const d = C.blank(C.suggestCurrency(navigator.languages || [navigator.language]));
   C.addAccount(d, { name: 'كاش', type: 'cash', currency: d.settings.displayCurrency, opening: 0 });
   start(d);

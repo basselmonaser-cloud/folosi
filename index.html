@@ -41,7 +41,7 @@
   <symbol id="i-cloud" viewBox="0 0 24 24"><path d="M7 18a5 5 0 1 1 .9-9.9A6 6 0 0 1 19 10a4 4 0 0 1-1 8z"/></symbol>
 </svg>
 
-<div id="lock" class="lock" hidden></div>
+<div id="lock" class="lock" aria-live="polite"><div class="box"><img src="./icons/icon-192.png" alt=""><p class="muted">جارٍ التحقق من الحماية…</p></div></div>
 
 <div id="app" hidden>
   <header class="top">
@@ -61,6 +61,7 @@
     <section class="view" id="v-more"></section>
     <section class="view" id="v-settings"></section>
     <section class="view" id="v-detail"></section>
+    <section class="view" id="v-converter"></section>
   </main>
   <nav class="bottom-nav" aria-label="التنقل الرئيسي"><div class="in">
     <button class="nav-btn" data-nav="home"><svg class="i"><use href="#i-home"/></svg>الرئيسية</button>

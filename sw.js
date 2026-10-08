@@ -1,6 +1,6 @@
 // فلوسي — Service Worker. يخزن ملفات التطبيق فقط (لا يلمس بياناتك المالية).
 // غيّر VERSION مع كل إصدار حتى يكتشف الجهاز وجود تحديث.
-const VERSION = '3.0.1';
+const VERSION = '3.0.2';
 const CACHE = 'folosi-app-' + VERSION;
 const ASSETS = [
   './', './index.html', './privacy.html', './manifest.webmanifest', './css/app.css',
@@ -10,10 +10,17 @@ const ASSETS = [
   './fonts/ibm-plex-sans-arabic-latin-400-normal.woff2', './fonts/ibm-plex-sans-arabic-latin-500-normal.woff2', './fonts/ibm-plex-sans-arabic-latin-700-normal.woff2',
 ];
 
+// بعض الاستضافات (مثل Cloudflare Pages) تحوّل ‎/index.html إلى ‎/ ؛ المتصفح يرفض عرض استجابة «محوَّلة» لتحميل صفحة،
+// لذلك نخزّن نسخة نظيفة من كل ملف بدل الاستجابة المحوَّلة.
+async function freshCopy(url) {
+  const res = await fetch(new Request(url, { cache: 'reload' }));
+  if (!res.ok) throw new Error('precache ' + url + ' ' + res.status);
+  return res.redirected ? new Response(await res.blob(), { status: 200, statusText: 'OK', headers: res.headers }) : res;
+}
 self.addEventListener('install', (event) => {
   event.waitUntil((async () => {
     const cache = await caches.open(CACHE);
-    await cache.addAll(ASSETS.map((u) => new Request(u, { cache: 'reload' })));
+    await Promise.all(ASSETS.map(async (u) => cache.put(u, await freshCopy(u))));
     // الإصدارات 2.x كانت تجلب الملفات من الشبكة مباشرة، فالصفحة المفتوحة هي الجديدة أصلًا — التفعيل الفوري آمن
     const keys = await caches.keys();
     if (keys.some((k) => /^folosi-v2/.test(k))) await self.skipWaiting();
@@ -34,8 +41,10 @@ self.addEventListener('fetch', (event) => {
   if (req.mode === 'navigate') {
     event.respondWith((async () => {
       const cache = await caches.open(CACHE);
-      const path = url.pathname.endsWith('/privacy.html') ? './privacy.html' : './index.html';
-      return (await cache.match(path)) || fetch(req).catch(() => cache.match('./index.html'));
+      const path = /\/privacy(\.html)?$/.test(url.pathname) ? './privacy.html' : './index.html';
+      const hit = (await cache.match(path)) || (await cache.match('./'));
+      if (hit && !hit.redirected) return hit;
+      try { return await fetch(req); } catch { return (await cache.match('./index.html')) || Response.error(); }
     })());
     return;
   }

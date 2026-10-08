@@ -1,6 +1,6 @@
 // فلوسي — منطق البيانات (بدون واجهة). كل الدوال هنا قابلة للاختبار في Node.
 export const SCHEMA = 3;
-export const APP_VERSION = '3.0.1';
+export const APP_VERSION = '3.0.2';
 
 export const STORAGE_KEYS = Object.freeze({
   data: 'folosi_v2',            // المفتاح الأصلي — لا يتغير حفاظًا على بيانات المستخدمين
@@ -148,6 +148,14 @@ export const DEFAULT_CATEGORIES = Object.freeze({
     'اتصالات وإنترنت', 'مواصلات', 'تسوق', 'تحويلات للأهل', 'صحة', 'تعليم', 'معدات وشغل', 'ترفيه', 'سداد ديون', 'أخرى'],
 });
 export const ACCOUNT_TYPES = { cash: 'كاش', bank: 'بنك', wallet: 'محفظة', card: 'بطاقة', other: 'آخر' };
+export function guessAccountType(name) {
+  const n = String(name || '').toLowerCase();
+  if (/كاش|نقد|نقدي|cash/.test(n)) return 'cash';
+  if (/stc|برق|barq|محفظ|wallet|urpay|يور ?باي|apple ?pay|mada pay|tabby|تابي/.test(n)) return 'wallet';
+  if (/بطاق|card|visa|فيزا|ماستر/.test(n)) return 'card';
+  if (/بنك|مصرف|bank|الراجحي|الإنماء|الأهلي|الرياض|البلاد|الجزيرة|(^|\s)ساب($|\s)|الفرنسي|d360|snb|alinma|rajhi/.test(n)) return 'bank';
+  return null;
+}
 export const ACCOUNT_PRESETS = [
   { name: 'كاش', type: 'cash' }, { name: 'الراجحي', type: 'bank' }, { name: 'الإنماء', type: 'bank' },
   { name: 'الأهلي', type: 'bank' }, { name: 'D360', type: 'bank' }, { name: 'STC Bank', type: 'wallet' }, { name: 'برق', type: 'wallet' },
@@ -307,6 +315,54 @@ export function totalBalance(data, rates, display = data.settings.displayCurrenc
   return t.result();
 }
 export const reportable = (t) => !t.excludeFromReports;
+// تفصيل الأرصدة حسب نوع الحساب. كل حساب يبقى بعملته الأصلية، والمجاميع تُحوَّل إلى عملة العرض فقط
+// عند توفر سعر؛ الحساب الذي لا سعر لعملته لا يُجمع أبدًا كأنه بعملة العرض.
+export const BALANCE_GROUPS = [
+  { key: 'cash', label: 'النقد (الكاش)', types: ['cash'] },
+  { key: 'bank', label: 'الحسابات البنكية', types: ['bank'] },
+  { key: 'wallet', label: 'المحافظ الإلكترونية', types: ['wallet'] },
+  { key: 'other', label: 'بطاقات وحسابات أخرى', types: ['card', 'other'] },
+];
+export function balancesByType(data, rates, display = data.settings.displayCurrency) {
+  const all = makeTotaler(display, rates);
+  const groups = BALANCE_GROUPS.map((g) => {
+    const t = makeTotaler(display, rates);
+    const accounts = data.accounts.filter((a) => g.types.includes(a.type) || (g.key === 'other' && !ACCOUNT_TYPES[a.type])).map((a) => {
+      const bal = balance(data, a), conv = convert(bal, a.currency, display, rates);
+      t.add(bal, a.currency); all.add(bal, a.currency);
+      return { id: a.id, name: a.name, type: a.type, currency: a.currency, archived: a.archived, balance: bal, converted: conv === null ? null : round(conv, display) };
+    });
+    // مجموع كل عملة بأصلها (بدون تحويل) للعرض الشفاف
+    const byCurrency = {};
+    for (const a of accounts) byCurrency[a.currency] = round((byCurrency[a.currency] || 0) + a.balance, a.currency);
+    return { ...g, ...t.result(), accounts, byCurrency };
+  });
+  return { ...all.result(), groups, display };
+}
+
+// محول العملات: يعيد النتيجة والسعر المستخدم ومصدره، أو ok:false إن لم يتوفر سعر (لا أسعار مختلقة)
+export function convertDetail(amount, from, to, rates) {
+  const a = parseAmount(amount);
+  if (!Number.isFinite(a) || a < 0) return { ok: false, reason: 'amount' };
+  const rate = convert(1, from, to, rates);
+  if (rate === null) {
+    const missing = [from, to].filter((c) => c !== 'USD' && unitsPerUSD(c, rates) === null);
+    return { ok: false, reason: 'rate', missing };
+  }
+  const src = (c) => (c === 'USD' ? null : rateSource(c, rates));
+  return { ok: true, amount: a, result: round(a * rate, to), rate, inverse: rate ? 1 / rate : null,
+    manual: [src(from), src(to)].includes('manual'), sources: { from: src(from), to: src(to) } };
+}
+// أسعار الريال اليمني حسب السوق (صنعاء/عدن) — تُطبَّق كسعر يدوي، أو يُعاد للسعر الآلي
+export function withYerMarket(rates, market) {
+  const r = { ...rates, manual: { ...(rates.manual || {}) }, yer: { ...(rates.yer || {}) } };
+  r.yer.active = market;
+  const m = r.yer[market];
+  if (market === 'auto' || !m || !(Number(m.value) > 0)) { delete r.manual.YER; if (market !== 'auto') r.yer.active = 'auto'; }
+  else r.manual.YER = { ref: m.ref || 'SAR', value: Number(m.value), at: m.at || new Date().toISOString(), label: market };
+  return r;
+}
+
 
 export function periodSummary(data, { from, to }, rates, display = data.settings.displayCurrency) {
   const inc = makeTotaler(display, rates), exp = makeTotaler(display, rates);
