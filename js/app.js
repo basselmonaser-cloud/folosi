@@ -9,6 +9,7 @@ import * as UIX from './ui-extra.js';
 import * as UIW from './ui-wealth.js';
 import * as Wm from './wealth.js';
 import * as UIM from './ui-more.js';
+import * as UIH from './ui-home.js';
 import { BETA } from './config.js';
 
 const K = C.STORAGE_KEYS;
@@ -121,7 +122,9 @@ const accountOptions = (selected, { exclude, all } = {}) => S.data.accounts.filt
 function rateHint(from, to) {
   const r = C.convert(1, from, to, S.rates);
   if (r === null) return { rate: '', hint: `لا يوجد سعر محفوظ لـ ${from} مقابل ${to} — أدخل السعر يدويًا.` };
-  const src = [C.rateSource(from, S.rates), C.rateSource(to, S.rates)].includes('manual') ? 'سعر يدوي' : S.rates.sourceName ? `${S.rates.sourceName} · ${dt(S.rates.fetchedAt)}` : '';
+  const man = [from, to].map((c) => (C.rateSource(c, S.rates) === 'manual' ? S.rates.manual?.[c] : null)).find(Boolean);
+  const YL = { sanaa: 'سوق صنعاء', aden: 'سوق عدن' };
+  const src = man ? `سعر يدوي${man.label ? ' — ' + (YL[man.label] || man.label) : ''}${man.at ? ' · أُدخل ' + dt(man.at) : ''}` : S.rates.sourceName ? `${S.rates.sourceName} · ${dt(S.rates.fetchedAt)}` : '';
   return { rate: String(+r.toFixed(6)), hint: `السعر المقترح: 1 ${from} = ${+r.toFixed(6)} ${to}${src ? ' · ' + src : ''}` };
 }
 
@@ -221,6 +224,7 @@ window.addEventListener('hashchange', () => { readHash(); closeSheet(); render()
 function render() {
   if (!S.data) return;
   for (const v of [...VIEWS, ...Object.keys(EXT.views)]) $('v-' + v)?.classList.toggle('active', v === S.view);
+  document.body.classList.toggle('home-b', S.view === 'home' && S.data.settings.homeStyle === 'b');
   const nav = NAV_OF[S.view] || EXT.nav[S.view] || 'more';
   document.querySelectorAll('[data-nav]').forEach((b) => (b.dataset.nav === nav ? b.setAttribute('aria-current', 'page') : b.removeAttribute('aria-current')));
   if (EXT.views[S.view]) { EXT.views[S.view](); renderStatus(); renderBanners(); renderUndo(); CTX.afterRender?.(); return; }
@@ -261,6 +265,7 @@ function shortcutList() {
   return [...new Set(s.filter((k) => SHORTCUTS[k]))];
 }
 function renderHome() {
+  if (CTX.renderHomeStyle?.()) return; // واجهة مختارة (أ/ب/ج) — عرض فقط
   const d = S.data, cur = disp();
   const bt = C.balancesByType(d, S.rates), tot = bt, mm = C.monthRange(C.today().slice(0, 7));
   const SHORT = { cash: 'النقد', bank: 'البنوك', wallet: 'المحافظ', other: 'أخرى' };
@@ -269,7 +274,7 @@ function renderHome() {
   const curs = new Set(d.accounts.map((a) => a.currency));
   const sc = shortcutList();
   const due = dueSoon();
-  $('v-home').innerHTML = `
+  $('v-home').innerHTML = `${CTX.homeSwitcher || ''}
     <div class="row-head"><small>اختصاراتك</small><button class="link-btn" data-action="edit-shortcuts">تخصيص</button></div>
     <div class="shortcuts">${sc.map((k) => `<button class="shortcut" data-shortcut="${k}"><span class="ico">${icon(SHORTCUTS[k][0])}</span><span>${SHORTCUTS[k][1]}</span></button>`).join('') || '<small class="muted">لا توجد اختصارات — اضغط تخصيص</small>'}</div>
     <div class="card hero hero-btn" role="button" tabindex="0" data-nav-to="detail/balances" aria-label="تفاصيل الأرصدة">
@@ -279,7 +284,7 @@ function renderHome() {
       <small>${countLabel(d.accounts.filter((a) => !a.archived).length)}${curs.size > 1 ? ` · ${curs.size} عملات محوّلة إلى ${esc(curName(cur))} بالسعر الحالي` : ''} · اضغط للتفاصيل</small>
     </div>
     ${missingNote(tot.missing)}
-    ${(() => { const w = d.wealth, has = w && (w.gold.lots.length || w.trades.length || w.investments.length); if (!has) return ''; const n = Wm.netWorth(d, S.rates); return `<button class="card nw-card" data-nav-to="wealth"><small>صافي الثروة — ثروتي</small><div class="v">${money(n.net, cur)}</div><small>السيولة + الذهب + الاستثمارات + المستحقات − الديون</small></button>`; })()}
+    ${(() => { const w = d.wealth, has = w && (w.gold.lots.length || w.trades.length || w.investments.length); if (!has) return ''; const n = Wm.netWorth(d, S.rates); return `<button class="card nw-card" data-nav-to="wealth"><small>${n.partial ? 'صافي الثروة — جزئي' : 'صافي الثروة — ثروتي'}</small><div class="v">${money(n.net, cur)}</div><small>${n.partial ? 'لا يشمل أصولًا غير مقيّمة' + (n.gold.grams > 0 && !n.gold.valuation ? ` (ذهب ${+n.gold.grams.toFixed(3)} غ)` : '') : 'السيولة + الذهب المقيّم + الاستثمارات + المستحقات − الديون'}</small></button>`; })()}
     <div class="stats">
       <button class="stat" data-nav-to="detail/income"><small>دخل الشهر</small><div class="v good">${money(sum.income, cur)}</div></button>
       <button class="stat" data-nav-to="detail/expense"><small>مصروف الشهر</small><div class="v bad">${money(sum.expense, cur)}</div></button>
@@ -866,7 +871,8 @@ function renderReports() {
     <div style="margin-top:10px">${r.mode === 'month' ? `<input type="month" id="repMonth" value="${esc(r.month)}" aria-label="الشهر">` : `<select id="repYear" aria-label="السنة">${years.map((y) => `<option${y === r.year ? ' selected' : ''}>${y}</option>`).join('')}</select>`}</div>
     <div class="card"><div class="kpis"><div><small>الدخل</small><b class="good">${money(s.income, cur)}</b></div><div><small>المصروف</small><b class="bad">${money(s.expense, cur)}</b></div><div><small>الصافي</small><b class="${s.net >= 0 ? 'good' : 'bad'}">${money(s.net, cur)}</b></div></div>
       ${r.mode === 'year' ? `<div style="margin-top:14px">${barChart(C.yearSeries(d, r.year, S.rates), cur)}</div>` : ''}
-      ${missingNote(s.missing)}${multi ? `<p class="hint">المبالغ بعملات أخرى محوّلة إلى ${esc(curName(cur))} بسعر الصرف الحالي (وليس سعر تاريخ العملية). ${S.rates.fetchedAt ? `آخر تحديث للأسعار: ${esc(dt(S.rates.fetchedAt))}` : ''}</p>` : ''}</div>
+      ${missingNote(s.missing)}${multi ? `<p class="hint">${s.converted ? '<b>الإجمالي أعلاه تقدير:</b> ' : ''}المبالغ بعملات أخرى محوّلة إلى ${esc(curName(cur))} بسعر الصرف الحالي (وليس سعر تاريخ العملية). ${S.rates.fetchedAt ? `آخر تحديث للأسعار: ${esc(dt(S.rates.fetchedAt))}` : ''}</p>` : ''}
+      ${s.byCurrency.length > 1 || s.converted ? `<h3 style="margin-top:12px">بعملاتها الأصلية (دون تحويل)</h3><ul class="list">${s.byCurrency.map((x) => `<li class="item"><div class="body"><div class="title">${esc(curName(x.currency))}</div><div class="sub">دخل ${plain(x.income, x.currency)} · مصروف ${plain(x.expense, x.currency)}</div></div><div class="amt ${x.net >= 0 ? 'good' : 'bad'}">${money(x.net, x.currency, { sign: true })}</div></li>`).join('')}</ul>` : ''}</div>
     ${(CTX.reportCards || []).map((f) => { try { return f(range); } catch { return ''; } }).join('')}
     <div class="card"><h3>المصروف حسب التصنيف</h3>${catBars(s.byCategory.expense, cur, '')}</div>
     <div class="card"><h3>الدخل حسب التصنيف</h3>${catBars(s.byCategory.income, cur, 'good')}</div>
@@ -974,7 +980,7 @@ function renderSettings() {
   const dr = S.drive;
   $('v-settings').innerHTML = `${head('الإعدادات')}
     <div class="card"><h3>المظهر</h3><label for="themeSel">طريقة العرض</label><select id="themeSel"><option value="system">تلقائي — حسب الجهاز</option><option value="light">فاتح</option><option value="dark">داكن</option></select>
-      <div class="actions"><button class="btn small" data-action="edit-shortcuts">تخصيص الاختصارات</button><button class="btn small" data-action="categories">إدارة التصنيفات</button></div></div>
+      <div class="actions"><button class="btn small" data-action="home-style">واجهة الرئيسية</button><button class="btn small" data-action="edit-shortcuts">تخصيص الاختصارات</button><button class="btn small" data-action="categories">إدارة التصنيفات</button></div></div>
 
     <div class="card"><h3>العملة وأسعار الصرف</h3><label for="curSel">عملة العرض الأساسية</label><select id="curSel">${currencyOptions(cur)}</select>
       <p class="hint">تُعرض الإجماليات والتقارير بهذه العملة. كل عملية تحتفظ بمبلغها وعملتها الأصليين.</p>
@@ -1657,13 +1663,13 @@ async function start(data, raw) {
   for (const fn of CTX.onStart || []) try { fn(); } catch (e) { console.warn('[folosi] start hook', e?.name); }
   if (S.session) Store.syncSideStores(S.session, S.session).catch(() => {});
   if (FX.isStale(S.rates, 12)) refreshRates(false);
-  if (IS_LOCAL) window.__folosi = { get data() { return S.data; }, get session() { return !!S.session; }, get history() { return S.history; }, setRates: (r) => { S.rates = r; render(); } };
+  if (IS_LOCAL) window.__folosi = { get data() { return S.data; }, get session() { return !!S.session; }, get history() { return S.history; }, get rates() { return S.rates; }, setRates: (r) => { S.rates = r; render(); } };
 }
 // ---------- سياق الوحدات الإضافية ----------
 const CTX = { S, $, esc, money, plain, nf, sym, toast, sheet, closeSheet, confirmBox, modal, commit, save, render, go, head, icon, acc, accountOptions, currencyOptions,
   dt, dateLabel, monthLabel, disp, errText, download, missingNote, pick, setPick, rateHint, curName, renderBanners, C, Store, B,
   runAction: (action, id) => { const b = document.createElement('button'); b.dataset.action = action; b.dataset.id = id; b.hidden = true; document.body.append(b); b.click(); b.remove(); } };
-for (const mod of [UIX, UIW, UIM]) {
+for (const mod of [UIX, UIW, UIM, UIH]) {
   const r = mod.register(CTX);
   for (const v of Object.keys(r.views || {})) if (!$('v-' + v)) { const sec = document.createElement('section'); sec.className = 'view'; sec.id = 'v-' + v; document.querySelector('main').append(sec); } Object.assign(EXT.views, r.views || {}); Object.assign(EXT.actions, r.actions || {}); Object.assign(EXT.nav, r.nav || {}); }
 async function boot() {

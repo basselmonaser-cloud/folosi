@@ -9,51 +9,43 @@ export function register(ctx) {
   const pct = (a, b) => (b ? `${a >= 0 ? '+' : ''}${((a / b) * 100).toFixed(1)}%` : '');
   const gl = (v, cur) => (v === null || v === undefined ? '<span class="muted">—</span>' : `<span class="${v >= 0 ? 'good' : 'bad'}">${money(v, cur, { sign: true })}</span>`);
   const accOpts = (sel, { none = 'بدون — لم تُدفع من حساباتي في فلوسي' } = {}) => `<option value="">${esc(none)}</option>` + S.data.accounts.filter((a) => !a.archived).map((a) => `<option value="${esc(a.id)}"${a.id === sel ? ' selected' : ''}>${esc(a.name)} — ${a.currency} (${plain(C.balance(S.data, a), a.currency)})</option>`).join('');
-  ctx.extraDiagnostics.push((d) => Wm.diagnoseWealth(d));
+  ctx.extraDiagnostics.push((d, r) => Wm.diagnoseWealth(d, r));
   Object.assign(ctx.fixers, Wm.FIXERS);
 
   // ---------- الأسعار ----------
+  // الأسهم: تلقائي (عند الفتح، كل 15 دقيقة، يدويًا) فقط إن أضفت مفتاحك. الذهب: لا تحديث تلقائي أبدًا — اقتراح عند الطلب داخل الحاسبة فقط.
   const heldSecurities = () => { const { holdings } = Wm.replayHoldings(S.data, { strict: false }); const ids = new Set(holdings.filter((h) => h.qty > 0).map((h) => h.securityId)); return S.data.wealth.securities.filter((s) => ids.has(s.id)); };
   async function refreshPrices(manual = false) {
     if (!S.data || S.priceBusy) return;
+    const key = S.data.settings.twelveDataKey, secs = heldSecurities();
+    if (!key || !secs.length) { if (manual) toast(key ? 'لا توجد أسهم مملوكة لتحديثها' : 'أضف مفتاح Twelve Data من «مصدر الأسعار» أو استخدم السعر اليدوي', !key); return; }
     if (navigator.onLine === false) { if (manual) toast('لا يوجد اتصال — تُعرض آخر أسعار محفوظة', true); return; }
     S.priceBusy = true; renderIfWealth();
     try {
-      let { market, ok, errors } = await P.refreshMetals(S.data.market || {});
-      let q = { ok: 0, tried: 0 };
-      const key = S.data.settings.twelveDataKey, secs = heldSecurities();
-      if (key && secs.length) { const r = await P.refreshQuotes(market, secs, key); market = r.market; q = r; }
+      const r = await P.refreshQuotes(S.data.market || {}, secs, key);
       if (!S.data) return;
-      S.data.market = market;
-      Wm.recordNetWorth(S.data, nwNow());
-      S.data.updatedAt = new Date().toISOString();
+      S.data.market = r.market; Wm.recordNetWorth(S.data, nwNow()); S.data.updatedAt = new Date().toISOString();
       await ctx.save();
-      if (manual) toast(ok ? `تم تحديث سعر الذهب${q.tried ? ` و${q.ok} من ${q.tried} أسهم` : ''}` : `تعذر تحديث سعر الذهب (${errors.gold === 'offline' ? 'لا اتصال' : errors.gold === 'timeout' ? 'انتهت المهلة' : 'المصدر لم يستجب'}) — بقي آخر سعر محفوظ`, !ok);
+      if (manual) toast(r.ok ? `تم تحديث ${r.ok} من ${r.tried} أسهم` : 'تعذر تحديث الأسعار — بقيت آخر أسعار محفوظة', !r.ok);
     } finally { S.priceBusy = false; renderIfWealth(); }
   }
-  const renderIfWealth = () => { if (['wealth', 'gold', 'stocks', 'investments', 'zakat', 'performance'].includes(S.view)) ctx.render(); };
+  async function suggestGoldOnline() {
+    if (navigator.onLine === false) throw new C.ValidationError('لا يوجد اتصال');
+    const r = await P.refreshMetals(S.data.market || {});
+    S.data.market = r.market; await ctx.save();
+    if (!r.ok) throw new C.ValidationError('تعذر جلب السعر العالمي — أدخل السعر يدويًا');
+    return r.market.gold;
+  }
+  const renderIfWealth = () => { if (['wealth', 'gold', 'stocks', 'investments', 'zakat', 'performance', 'gold-calc'].includes(S.view)) ctx.render(); };
   ctx.onStart = (ctx.onStart || []);
   ctx.onStart.push(() => {
-    // لقطة صافي الثروة اليومية (دون إنترنت تُحسب بآخر أسعار محفوظة)
     try { const before = JSON.stringify(S.data.netWorthHistory?.at(-1) || null); Wm.recordNetWorth(S.data, nwNow()); if (JSON.stringify(S.data.netWorthHistory.at(-1)) !== before) ctx.save(); } catch {}
-    const st = P.priceStatus(S.data.market?.gold, { maxHours: 1 });
-    if (st.state !== 'fresh') refreshPrices(false);
+    const q = Object.values(S.data.market?.quotes || {}), stale = !q.length || q.some((x) => Date.now() - Date.parse(x.fetchedAt) > 36e5);
+    if (stale) refreshPrices(false);
     clearInterval(S.priceTimer);
     S.priceTimer = setInterval(() => { if (document.visibilityState === 'visible' && S.data) refreshPrices(false); }, 15 * 60 * 1000);
   });
-  window.addEventListener('online', () => { if (S.data && P.priceStatus(S.data.market?.gold, { maxHours: 1 }).state !== 'fresh') refreshPrices(false); });
-
-  function goldPriceStrip() {
-    const g = S.data.market?.gold, st = P.priceStatus(g), cur = disp(), err = S.data.market?.goldError;
-    const g24 = Wm.gramPrice(S.data.market, cur, S.rates), g21 = Wm.gramPrice(S.data.market, cur, S.rates, 21 / 24);
-    return `<div class="card price-strip"><div class="card-head" style="margin-bottom:6px"><h3 style="margin:0">سعر الذهب</h3>
-      <button class="btn small" data-action="refresh-prices" ${S.priceBusy ? 'disabled' : ''}>${S.priceBusy ? 'جارٍ التحديث…' : 'تحديث الآن'}</button></div>
-      ${g24 !== null ? `<div class="kpis"><div><small>عيار 24 / غرام</small><b>${money(g24, cur)}</b></div><div><small>عيار 21 / غرام</small><b>${money(g21, cur)}</b></div><div><small>الأونصة</small><b>${money(g.usdPerOz, 'USD')}</b></div></div>
-        <p class="hint" style="margin:6px 0 0">سعر فوري عالمي (Spot) من <a href="${P.GOLD_SOURCE.site}" target="_blank" rel="noopener noreferrer">${esc(g.sourceName || P.GOLD_SOURCE.name)}</a> · نُشر ${esc(g.updatedAt ? dt(g.updatedAt) : '—')} · جُلب ${esc(dt(g.fetchedAt))}
-        ${st.state === 'stale' ? ' · <span class="tag warn">قديم</span>' : ''}<br>ليس سعر البيع أو الشراء لدى محلات الذهب، ولا يشمل المصنعية. محوّل بسعر صرف ${esc(cur)} الحالي.</p>`
-      : `<p class="muted" style="margin:0">لا يوجد سعر ذهب محفوظ بعد${err ? ` (آخر محاولة: ${esc(dt(err.at))} — ${err.reason === 'offline' ? 'لا اتصال' : 'فشل الاتصال بالمصدر'})` : ''}. قيمة الذهب لن تُحسب حتى يتوفر سعر حقيقي.</p>`}
-      ${g24 !== null && err && Date.parse(err.at) > Date.parse(g.fetchedAt) ? `<p class="hint bad" style="margin:4px 0 0">فشل آخر تحديث (${esc(dt(err.at))}) — يُعرض آخر سعر صالح.</p>` : ''}</div>`;
-  }
+  window.addEventListener('online', () => { if (S.data) refreshPrices(false); });
 
   // ---------- رسوم بيانية (SVG بلا مكتبات) ----------
   function allocBars(parts, cur) {
@@ -93,124 +85,157 @@ export function register(ctx) {
   });
 
   // ---------- ثروتي ----------
+  const curL = (c) => `${ctx.sym(c)}`;
+  const costsText = (costs) => Object.entries(costs).map(([c, v]) => plain(v, c)).join(' + ') || '—';
   function renderWealth() {
-    const n = nwNow(), cur = disp(), p = n.parts;
-    const tile = (label, v, nav, cls = '', sub = '') => `<button class="stat" ${nav}><small>${label}</small><div class="v ${cls}">${money(v, cur)}</div>${sub ? `<small>${sub}</small>` : ''}</button>`;
-    const g = n.gold;
+    const n = nwNow(), cur = disp(), p = n.parts, g = n.gold;
+    const tile = (label, inner, nav, sub = '') => `<button class="stat" ${nav}><small>${label}</small><div class="v">${inner}</div>${sub ? `<small>${sub}</small>` : ''}</button>`;
+    const m = (v, cls = '') => `<span class="${cls}">${money(v, cur)}</span>`;
     $('v-wealth').innerHTML = `<div class="view-head"><h2>ثروتي</h2></div>
-      <div class="card hero"><small>صافي الثروة</small><div class="big"><span class="num">${p && n.net < 0 ? '-' : ''}${ctx.nf(cur).format(Math.abs(n.net))}</span><span class="cur">${esc(ctx.sym(cur))}</span></div>
-        <div class="hero-groups"><span><small>الأصول</small><b class="num">${ctx.nf(cur).format(n.assets)}</b></span><span><small>الالتزامات</small><b class="num">${ctx.nf(cur).format(p.liabilities)}</b></span></div>
-        <small>الأصول والحقوق القابلة للتقييم − الديون عليّ. الأهداف لا تُضاف لأنها جزء من أموالك الموجودة.</small></div>
+      <div class="card hero"><small>${n.partial ? 'صافي الثروة — جزئي' : 'صافي الثروة'}</small><div class="big"><span class="num">${n.net < 0 ? '-' : ''}${ctx.nf(cur).format(Math.abs(n.net))}</span><span class="cur">${esc(ctx.sym(cur))}</span></div>
+        <div class="hero-groups"><span><small>الأصول المقيّمة</small><b class="num">${ctx.nf(cur).format(n.assets)}</b></span><span><small>الالتزامات</small><b class="num">${ctx.nf(cur).format(p.liabilities)}</b></span></div>
+        <small>${n.partial ? 'لا يشمل أصولًا غير مقيّمة (انظر الملاحظات) — ليس إجمالي ثروتك الكامل.' : 'الأصول والحقوق المقيّمة − الديون عليّ.'} الأهداف لا تُضاف.</small></div>
       ${n.notes.length ? `<div class="notice">${n.notes.map((x) => `<div>• ${esc(x)}</div>`).join('')}</div>` : ''}
-      <div class="stats">
-        ${tile('السيولة المتاحة', p.liquidity, 'data-nav-to="accounts"')}
-        ${tile('الذهب', p.gold, 'data-nav-to="gold"', '', g.grams ? `${+g.grams.toFixed(3)} غ${g.priced ? '' : ' · بلا سعر'}` : '')}
-        ${tile('الأسهم', p.stocks, 'data-nav-to="stocks"')}
-        ${tile('الصناديق الاستثمارية', p.funds, 'data-nav-to="stocks"')}
-        ${tile('استثمارات أخرى', p.other, 'data-nav-to="investments"')}
-        ${tile('مستحقات لي', p.receivables, 'data-action="wealth-debts" data-type="receivable"')}
-        ${tile('التزامات وديون عليّ', p.liabilities, 'data-action="wealth-debts" data-type="debt"', 'bad')}
-      </div>
+      <h3 class="sec-h">السيولة</h3><div class="stats">${tile('النقد والبنوك والمحافظ', m(p.liquidity), 'data-nav-to="accounts"')}</div>
+      <h3 class="sec-h">الذهب</h3><div class="stats">${tile('الذهب المملوك', `<span class="num">${+g.grams.toFixed(3)}</span> <span class="sym">غ</span>`, 'data-nav-to="gold"', g.valuation ? `مقيّم: ${plain(g.valueDisplay, cur)} (${esc(g.valuation.date)})` : `${g.lots} قطعة · غير مقيّم`)}
+        ${tile('حاسبة الذهب', '<span style="font-size:15px">احسب القيمة بسعرك</span>', 'data-nav-to="gold-calc"')}</div>
+      <h3 class="sec-h">الأسهم والاستثمارات</h3><div class="stats">
+        ${tile('الأسهم', m(p.stocks), 'data-nav-to="stocks"')}${tile('الصناديق وETF', m(p.funds), 'data-nav-to="stocks"')}${tile('استثمارات أخرى', m(p.other), 'data-nav-to="investments"')}</div>
+      <h3 class="sec-h">الحقوق والالتزامات</h3><div class="stats">
+        ${tile('مستحقات لي', m(p.receivables), 'data-action="wealth-debts" data-type="receivable"')}${tile('ديون والتزامات عليّ', m(p.liabilities, 'bad'), 'data-action="wealth-debts" data-type="debt"')}</div>
       <div class="card"><div class="kpis"><div><small>أرباح/خسائر محققة</small><b>${gl(n.realized, cur)}</b></div><div><small>غير محققة</small><b>${gl(n.unrealized, cur)}</b></div></div>
-        <p class="hint" style="margin-bottom:0">المحققة: من البيع والتوزيعات. غير المحققة: الفرق بين القيمة الحالية والتكلفة لما تملكه الآن (الذهب مجهول التكلفة لا يدخل).</p></div>
-      <div class="card"><h3>توزيع الأصول</h3>${allocBars(p, cur)}</div>
+        <p class="hint" style="margin-bottom:0">المحققة: من البيع والتوزيعات. غير المحققة: الأسهم والاستثمارات المسعّرة فقط — الذهب غير المقيّم لا يدخل.</p></div>
+      <div class="card"><h3>توزيع الأصول المقيّمة</h3>${allocBars(p, cur)}</div>
       <div class="card"><h3>تغيّر صافي الثروة</h3>${trendChart(S.data.netWorthHistory || [], cur)}</div>
-      ${goldPriceStrip()}
       <div class="more-grid">
-        <button class="shortcut" data-nav-to="gold"><span class="ico">${ctx.icon('i-gold')}</span><span>الذهب</span></button>
-        <button class="shortcut" data-nav-to="stocks"><span class="ico">${ctx.icon('i-chart')}</span><span>الأسهم والصناديق</span></button>
-        <button class="shortcut" data-nav-to="investments"><span class="ico">${ctx.icon('i-target')}</span><span>استثمارات أخرى</span></button>
         <button class="shortcut" data-nav-to="performance"><span class="ico">${ctx.icon('i-chart')}</span><span>الأداء الاستثماري</span></button>
         <button class="shortcut" data-nav-to="zakat"><span class="ico">${ctx.icon('i-hand')}</span><span>حاسبة الزكاة</span></button>
         <button class="shortcut" data-nav-to="reports"><span class="ico">${ctx.icon('i-chart')}</span><span>التقارير</span></button>
       </div>`;
   }
 
-  // ---------- الذهب ----------
+  // ---------- الذهب: كميات أولًا، بلا تقييم تلقائي ----------
+  const lotRow = (l) => `<li><button class="item" data-action="gold-open" data-id="${esc(l.id)}"><span class="ico">${ctx.icon('i-gold')}</span><div class="body"><div class="title">${esc(l.name)} ${l.ownership && l.ownership !== 'owned' ? `<span class="tag ${l.ownership === 'owned-elsewhere' ? '' : 'warn'}">${esc(Wm.OWNERSHIP[l.ownership])}</span>` : ''}${l.remaining <= 0 ? '<span class="tag">مُباع</span>' : l.remaining < l.grams ? '<span class="tag">بيع جزئي</span>' : ''}</div>
+    <div class="sub">${esc(l.kind === 'custom' ? l.kindLabel || Wm.GOLD_KINDS.custom : Wm.GOLD_KINDS[l.kind])} · ${esc(Wm.karatLabel(l))}${(l.pieces || 1) > 1 ? ` · ${l.pieces} قطع` : ''}${l.location ? ' · ' + esc(l.location) : ''}</div></div>
+    <div class="amt"><span class="num">${+l.remaining.toFixed(3)}</span> <span class="sym">غ</span>${l.costBasis !== null ? `<small>${plain(l.costBasis, l.currency)}</small>` : '<small>تكلفة مجهولة</small>'}</div></button></li>`;
   function renderGold() {
-    const cur = disp(), g = Wm.goldSummary(S.data, S.data.market, S.rates);
-    const lots = [...g.items].sort((a, b) => (b.lot.remaining > 0) - (a.lot.remaining > 0) || (b.lot.date || '').localeCompare(a.lot.date || ''));
+    const h = Wm.goldHoldings(S.data), lots = S.data.wealth.gold.lots, v = Wm.approvedValuation(S.data);
+    const active = lots.filter((l) => !l.archived && l.remaining > 0), sold = lots.filter((l) => !l.archived && l.remaining <= 0), archived = lots.filter((l) => l.archived);
+    const own = active.filter(Wm.isOwnedGold), other = active.filter((l) => !Wm.isOwnedGold(l));
     $('v-gold').innerHTML = `${head('الذهب', 'wealth')}
-      <div class="card"><div class="kpis"><div><small>إجمالي الوزن</small><b>${+g.grams.toFixed(3)} غ</b></div><div><small>مكافئ الذهب الخالص</small><b>${+g.pureGrams.toFixed(3)} غ</b></div></div>
-        ${Object.keys(g.byKarat).length ? `<div class="chip-row" style="margin-top:8px">${Object.entries(g.byKarat).map(([k, v]) => `<span class="tag">${esc(k)}: ${+v.toFixed(3)} غ</span>`).join('')}</div>` : ''}
-        <div class="kpis" style="margin-top:10px"><div><small>القيمة السوقية (الذهب الخالص)</small><b>${g.priced ? money(g.marketValue, cur) : '—'}</b></div><div><small>بعد خصم إعادة البيع</small><b>${g.priced ? money(g.resaleValue, cur) : '—'}</b></div></div>
-        <div class="kpis" style="margin-top:10px"><div><small>تكلفة المتبقي (المعروفة)</small><b>${money(g.costOfKnown, cur)}</b></div><div><small>غير محقق</small><b>${g.priced ? gl(g.unrealized, cur) : '—'}</b></div><div><small>محقق</small><b>${gl(g.realized, cur)}</b></div></div>
-        ${g.valueUnknownCost ? `<p class="hint">ذهب بتكلفة مجهولة قيمته ${plain(g.valueUnknownCost, cur)} — لا يدخل في حساب الربح.</p>` : ''}
-        <p class="hint" style="margin-bottom:0">القيمة = الوزن × النقاء × السعر الفوري. سعر بيع المشغولات الفعلي عادة أقل (يُخصم منه)؛ حدد «خصم إعادة البيع» لكل قطعة لتقدير أدق.</p></div>
-      <button class="btn primary block" data-action="gold-add">إضافة ذهب</button>
-      ${goldPriceStrip()}
-      <div class="card">${lots.length ? `<ul class="list">${lots.map((it) => { const l = it.lot; return `<li><button class="item" data-action="gold-open" data-id="${esc(l.id)}"><span class="ico">${ctx.icon('i-gold')}</span><div class="body"><div class="title">${esc(l.name)} ${l.remaining <= 0 ? '<span class="tag">مُباع</span>' : l.remaining < l.grams ? '<span class="tag">بيع جزئي</span>' : ''}</div>
-        <div class="sub">${esc(l.kind === 'custom' ? l.kindLabel || Wm.GOLD_KINDS.custom : Wm.GOLD_KINDS[l.kind])} · ${esc(Wm.karatLabel(l))} · ${+l.remaining.toFixed(3)}${l.remaining < l.grams ? ` من ${+l.grams.toFixed(3)}` : ''} غ${l.location ? ' · ' + esc(l.location) : ''}</div></div>
-        <div class="amt">${it.resaleValue !== null ? money(it.resaleValue, cur) : '—'}<small>${it.unrealized !== null ? gl(it.unrealized, cur) : l.costBasis === null ? 'تكلفة مجهولة' : ''}</small></div></button></li>`; }).join('')}</ul>` : '<div class="empty">لم تسجل أي ذهب بعد</div>'}</div>`;
+      <div class="card"><div class="kpis"><div><small>الوزن المملوك</small><b>${+h.grams.toFixed(3)} غ</b></div><div><small>عدد القطع</small><b>${h.pieces}</b></div><div><small>مكافئ الذهب الخالص</small><b>${+h.pureGrams.toFixed(3)} غ</b></div></div>
+        ${Object.keys(h.byKarat).length ? `<div class="chip-row" style="margin-top:8px">${Object.entries(h.byKarat).map(([k, x]) => `<span class="tag">${esc(k)}: ${+x.toFixed(3)} غ</span>`).join('')}</div>` : ''}
+        ${Object.keys(h.byLocation).length ? `<p class="hint" style="margin:8px 0 0">أماكن الحفظ: ${Object.entries(h.byLocation).map(([k, x]) => `${esc(k)} (${+x.toFixed(3)} غ)`).join('، ')}</p>` : ''}
+        <p class="hint" style="margin:6px 0 0">تكلفة الشراء للمتبقي بعملاتها الأصلية: ${esc(costsText(h.costs))}${h.unknownCost ? ` · ${h.unknownCost} قطعة بتكلفة مجهولة` : ''}</p>
+        ${h.trust.lots || h.claim.lots ? `<p class="hint" style="margin:6px 0 0">${h.trust.lots ? `أمانات لديك (لا تملكها): ${+h.trust.grams.toFixed(3)} غ · ` : ''}${h.claim.lots ? `مطالبات لم تستلمها: ${+h.claim.grams.toFixed(3)} غ` : ''} — غير محسوبة ضمن ملكيتك.</p>` : ''}
+        <div class="notice info" style="margin-bottom:0">${v ? `قيمة ذهبك المعتمدة في «ثروتي»: ${plain(Wm.goldSummary(S.data, S.rates).value, v.currency)} بأسعارك بتاريخ ${esc(v.date)} (${esc(v.marketLabel)}).` : 'الذهب يُعرض بالجرامات فقط. فلوسي لا يحسب قيمته ولا يضيفه لصافي ثروتك إلا إذا قيّمته بنفسك من «حاسبة الذهب».'}</div></div>
+      <div class="actions"><button class="btn primary" data-action="gold-add">إضافة ذهب</button><button class="btn" data-nav-to="gold-calc">حاسبة الذهب</button></div>
+      <div class="card"><h3>ذهبي</h3>${own.length ? `<ul class="list">${own.map(lotRow).join('')}</ul>` : '<div class="empty">لم تسجل أي ذهب بعد</div>'}</div>
+      ${other.length ? `<div class="card"><h3>أمانات ومطالبات (ليست ملكًا حاضرًا)</h3><ul class="list">${other.map(lotRow).join('')}</ul></div>` : ''}
+      ${sold.length ? `<div class="card"><h3>مُباع بالكامل</h3><ul class="list">${sold.map(lotRow).join('')}</ul></div>` : ''}
+      ${archived.length ? `<details class="card"><summary>الأرشيف (${archived.length})</summary><ul class="list">${archived.map(lotRow).join('')}</ul></details>` : ''}`;
   }
   function goldForm(id) {
     const l = id ? S.data.wealth.gold.lots.find((x) => x.id === id) : null;
     const sold = l && S.data.wealth.gold.sales.some((s) => s.lotId === l.id);
+    const lastCur = S.data.settings.lastGoldCurrency || '';
+    const curSel = (name, sel) => `<select name="${name}" required><option value="">— اختر العملة —</option>${currencyOptions(sel)}</select>`;
     sheet(l ? 'تعديل قطعة ذهب' : 'إضافة ذهب', `
       <label for="gN">اسم القطعة</label><input id="gN" name="name" required maxlength="90" placeholder="سبيكة 10 غ، طقم الزفاف، ليرة…" value="${esc(l?.name || '')}">
       <div class="grid2"><div><label>النوع</label><select name="kind">${Object.entries(Wm.GOLD_KINDS).map(([k, v]) => `<option value="${k}"${(l?.kind || 'jewelry') === k ? ' selected' : ''}>${v}</option>`).join('')}</select></div>
         <div><label>العيار</label><select name="karat" ${sold ? 'disabled' : ''}>${Wm.KARATS.map((k) => `<option value="${k}"${(l?.karat ?? 21) === k ? ' selected' : ''}>عيار ${k}</option>`).join('')}<option value="custom"${l?.karat === 'custom' ? ' selected' : ''}>عيار/نقاء مخصص</option></select></div></div>
       <div id="gKL" hidden><label>اسم النوع</label><input name="kindLabel" maxlength="40" value="${esc(l?.kindLabel || '')}"></div>
       <div id="gPu" hidden><label>النقاء (عيار مثل 14، أو نسبة 0.585، أو بالألف 585)</label><input name="purity" inputmode="decimal" value="${l?.karat === 'custom' ? esc(l.purity) : ''}"></div>
-      <label for="gG">الوزن بالجرام</label><input id="gG" name="grams" inputmode="decimal" required value="${esc(l?.grams ?? '')}" ${sold ? 'disabled' : ''}>
-      ${l ? '' : `<label>كيف حصلت عليه؟</label><div class="seg">${pick('acquisition', 'purchase', 'شراء')}${pick('acquisition', 'owned', 'أملكه مسبقًا')}</div><input type="hidden" name="acquisition" value="purchase">
-        <div id="gOwned" hidden><label>هل تعرف تكلفة اقتنائه؟</label><div class="seg">${pick('costKnown', 'yes', 'نعم')}${pick('costKnown', 'no', 'لا — تكلفة مجهولة')}</div><input type="hidden" name="costKnown" value="no">
-          <p class="hint">ذهب موجود أصلًا (هدية، ورث، قديم): يُضاف لثروتك دون أي حركة على حساباتك. إن كانت التكلفة مجهولة لا يُحسب له ربح أو خسارة.</p></div>
-        <div id="gCost"><div class="grid2" style="grid-template-columns:2fr 1fr"><div><label>سعر الشراء الإجمالي (دون المصنعية)</label><input name="cost" inputmode="decimal"></div><div><label>العملة</label><select name="currency">${currencyOptions(disp())}</select></div></div>
+      <div class="grid2"><div><label>الوزن الصافي للذهب (غ)</label><input name="grams" inputmode="decimal" required value="${esc(l?.grams ?? '')}" ${sold ? 'disabled' : ''}></div>
+        <div><label>الوزن الإجمالي (غ) — مع الأحجار</label><input name="grossGrams" inputmode="decimal" placeholder="اختياري" value="${esc(l && l.grossGrams !== l.grams ? l.grossGrams : '')}"></div></div>
+      <div class="grid2"><div><label>عدد القطع</label><input name="pieces" inputmode="numeric" value="${esc(l?.pieces ?? 1)}"></div>
+        <div><label>الحيازة</label><select name="ownership">${Object.entries(Wm.OWNERSHIP).map(([k, v]) => `<option value="${k}"${(l?.ownership || 'owned') === k ? ' selected' : ''}>${v}</option>`).join('')}</select></div></div>
+      <div id="gHolder" hidden><label id="gHolderL">اسم الشخص</label><input name="holder" maxlength="90" value="${esc(l?.holder || '')}"></div>
+      ${l ? '' : `<label>كيف حصلت عليه؟</label><div class="seg">${pick('acquisition', 'owned', 'أصل أملكه من قبل')}${pick('acquisition', 'purchase', 'شراء جديد الآن')}</div><input type="hidden" name="acquisition" value="owned">
+        <p class="hint" id="gAcqH"></p>
+        <div id="gOwned"><label>هل تعرف تكلفة اقتنائه؟</label><div class="seg">${pick('costKnown', 'yes', 'نعم')}${pick('costKnown', 'no', 'لا — مجهولة')}</div><input type="hidden" name="costKnown" value="no"></div>
+        <div id="gCost" hidden><div class="grid2" style="grid-template-columns:3fr 2fr"><div><label>سعر الشراء (دون المصنعية)</label><input name="cost" inputmode="decimal"></div><div><label>عملة الشراء</label>${curSel('currency', lastCur)}</div></div>
           <div class="grid2"><div><label>المصنعية</label><input name="making" inputmode="decimal" placeholder="0"></div><div><label>رسوم إضافية</label><input name="fees" inputmode="decimal" placeholder="0"></div></div>
-          <div id="gAccBox"><label>دُفع من حساب</label><select name="accountId">${accOpts('')}</select><div id="gPaid" hidden><label id="gPaidL"></label><input name="paid" inputmode="decimal"></div>
-          <p class="hint" id="gAccH">اختر الحساب ليُخصم المبلغ منه مرة واحدة (تبادل نقد بذهب — لا يُحتسب مصروفًا ولا يُضاعف ثروتك).</p></div></div>
+          <div class="cur-echo" id="gEcho" hidden></div>
+          <div id="gAccBox" hidden><label>دُفع من حساب</label><select name="accountId">${accOpts('', { none: 'بدون — دفعت من خارج حساباتي في فلوسي' })}</select><div id="gPaid" hidden><label id="gPaidL"></label><input name="paid" inputmode="decimal"></div>
+          <p class="hint">يُخصم من الحساب مرة واحدة (تبادل نقد بذهب — لا يُحتسب مصروفًا).</p></div></div>
         <label>تاريخ الشراء/الاقتناء</label><input type="date" name="date" value="${C.today()}">`}
       ${l?.acquisition === 'owned' && !l.txId ? `<label>تكلفة الاقتناء</label><div class="seg">${pick('costKnown', 'yes', 'معروفة')}${pick('costKnown', 'no', 'مجهولة')}</div><input type="hidden" name="costKnown" value="${l.costKnown ? 'yes' : 'no'}">
-        <div id="gOwnCost" ${l.costKnown ? '' : 'hidden'}><div class="grid2"><div><label>التكلفة</label><input name="cost" inputmode="decimal" value="${esc(l.cost || '')}"></div><div><label>المصنعية</label><input name="making" inputmode="decimal" value="${esc(l.making || '')}"></div></div></div>` : ''}
-      <div class="grid2"><div><label>مكان الحفظ</label><input name="location" maxlength="90" value="${esc(l?.location || '')}"></div><div><label>البائع (اختياري)</label><input name="seller" maxlength="90" value="${esc(l?.seller || '')}"></div></div>
-      <label>خصم إعادة البيع المتوقع % (اختياري)</label><input name="resaleDiscount" inputmode="decimal" placeholder="مثال: 5 للمشغولات" value="${esc(l?.resaleDiscount || '')}">
-      <label>ملاحظات</label><input name="note" maxlength="300" value="${esc(l?.note || '')}">
-      ${ctx.attachField ? ctx.attachField('gold', l?.id) : ''}`, {
+        <div id="gOwnCost" ${l.costKnown ? '' : 'hidden'}><div class="grid2" style="grid-template-columns:3fr 2fr"><div><label>التكلفة</label><input name="cost" inputmode="decimal" value="${esc(l.cost || '')}"></div><div><label>عملة الشراء</label>${curSel('currency', l.currency || lastCur)}</div></div>
+        <div class="grid2"><div><label>المصنعية</label><input name="making" inputmode="decimal" value="${esc(l.making || '')}"></div><div><label>رسوم</label><input name="fees" inputmode="decimal" value="${esc(l.fees || '')}"></div></div><div class="cur-echo" id="gEcho" hidden></div></div>` : ''}
+      ${l ? '' : `<label>مكان الحفظ</label><input name="location" maxlength="90" placeholder="الخزنة، البنك، عند الوالدة…">`}
+      <label>البائع (اختياري)</label><input name="seller" maxlength="90" value="${esc(l?.seller || '')}">
+      <label>ملاحظات</label><input name="note" maxlength="300" value="${esc(l?.note || '')}">`, {
       submit: l ? 'حفظ' : 'إضافة',
-      onReady: (b, form) => { if (!l) { setPick(form, 'acquisition', 'purchase'); setPick(form, 'costKnown', 'no'); } else if (form.elements.costKnown) setPick(form, 'costKnown', form.elements.costKnown.value); },
+      onReady: (b, form) => { if (!l) { setPick(form, 'acquisition', 'owned'); setPick(form, 'costKnown', 'no'); } else if (form.elements.costKnown) setPick(form, 'costKnown', form.elements.costKnown.value); },
       onChange: (form) => {
-        $('gKL').hidden = form.elements.kind.value !== 'custom'; $('gPu').hidden = form.elements.karat.value !== 'custom';
-        if (l) { if ($('gOwnCost')) $('gOwnCost').hidden = form.elements.costKnown.value !== 'yes'; return; }
-        const owned = form.elements.acquisition.value === 'owned';
-        $('gOwned').hidden = !owned; $('gCost').hidden = owned && form.elements.costKnown.value !== 'yes'; $('gAccBox').hidden = owned;
-        const a = acc(form.elements.accountId.value), diff = a && a.currency !== form.elements.currency.value;
-        $('gPaid').hidden = !diff; if (diff) $('gPaidL').textContent = `المبلغ المدفوع فعلًا بـ ${a.currency} (شامل المصنعية والرسوم)`;
+        const E = form.elements;
+        $('gKL').hidden = E.kind.value !== 'custom'; $('gPu').hidden = E.karat.value !== 'custom';
+        const own = E.ownership.value; $('gHolder').hidden = own === 'owned';
+        $('gHolderL').textContent = own === 'trust' ? 'صاحب الذهب (الأمانة له)' : own === 'claim' ? 'المطالَب (من سيسلمك الذهب)' : 'الشخص المحفوظ عنده';
+        const showCost = l ? E.costKnown?.value === 'yes' : (E.acquisition.value === 'purchase' || E.costKnown.value === 'yes');
+        if (!l) {
+          const purchase = E.acquisition.value === 'purchase';
+          $('gOwned').hidden = purchase; $('gCost').hidden = !showCost; $('gAccBox').hidden = !purchase;
+          $('gAcqH').textContent = purchase ? 'شراء ينفذ اليوم: يمكن خصمه من حساب. التكلفة مطلوبة.' : 'ذهب تملكه منذ مدة: لا يُخصم أي مبلغ من حساباتك الحالية.';
+          const a = acc(E.accountId.value), diff = a && E.currency.value && a.currency !== E.currency.value;
+          $('gPaid').hidden = !diff; if (diff) $('gPaidL').textContent = `المبلغ المدفوع فعلًا بـ ${a.currency} (شامل المصنعية والرسوم)`;
+        } else if ($('gOwnCost')) $('gOwnCost').hidden = !showCost;
+        // صدى العملة: يرى المستخدم المبلغ كما سيُحفظ حرفيًا
+        const echo = $('gEcho');
+        if (echo && E.cost) { const n = C.parseAmount(E.cost.value), c = E.currency?.value; echo.hidden = !(n > 0); echo.innerHTML = !c ? '<b class="bad">اختر عملة الشراء</b>' : `سيُحفظ سعر الشراء: <b>${plain(n, c)}</b> (${esc(ctx.curName(c))}) — ولن يتغير بتغيير عملة العرض.`; }
       },
       onSubmit: async (v) => {
+        if (v.currency) await commit((d) => { d.settings.lastGoldCurrency = v.currency; }, null, { history: false });
         if (l) return commit((d) => Wm.updateGoldLot(d, l.id, { ...v, grams: sold ? undefined : v.grams, karat: sold ? undefined : v.karat, purity: sold ? undefined : v.purity }), 'تم الحفظ', { label: `تعديل ذهب «${l.name}»` });
-        const owned = v.acquisition === 'owned';
-        const lot = await commit((d) => Wm.addGoldLot(d, { ...v, accountId: owned ? '' : v.accountId }), 'تمت إضافة الذهب', { label: `إضافة ذهب «${v.name}» ${v.grams}غ` });
-        if (ctx.attachCommit) await ctx.attachCommit('gold', lot.id);
+        const purchase = v.acquisition === 'purchase';
+        await commit((d) => Wm.addGoldLot(d, { ...v, accountId: purchase ? v.accountId : '' }), 'تمت إضافة الذهب', { label: `إضافة ذهب «${v.name}» ${v.grams}غ` });
       },
     });
   }
   function goldOpen(id) {
-    const cur = disp(), l = S.data.wealth.gold.lots.find((x) => x.id === id); if (!l) return;
-    const it = Wm.goldSummary(S.data, S.data.market, S.rates).items.find((x) => x.lot.id === id);
+    const l = S.data.wealth.gold.lots.find((x) => x.id === id); if (!l) return;
     const sales = S.data.wealth.gold.sales.filter((s) => s.lotId === id).sort((a, b) => b.date.localeCompare(a.date));
+    const li = (k, v) => `<li class="item"><div class="body"><div class="sub">${k}</div><div class="title">${v}</div></div></li>`;
     sheet(l.name, `
-      <div class="kpis"><div><small>المتبقي</small><b>${+l.remaining.toFixed(3)} غ</b></div><div><small>${esc(Wm.karatLabel(l))}</small><b>${+it.pureGrams.toFixed(3)} غ خالص</b></div><div><small>القيمة</small><b>${it.resaleValue !== null ? money(it.resaleValue, cur) : '—'}</b></div></div>
+      <div class="kpis"><div><small>المتبقي</small><b>${+l.remaining.toFixed(3)} غ</b></div><div><small>${esc(Wm.karatLabel(l))}</small><b>${+(l.remaining * l.purity).toFixed(3)} غ خالص</b></div><div><small>القطع</small><b>${l.pieces || 1}</b></div></div>
       <ul class="list" style="margin-top:8px">
-        <li class="item"><div class="body"><div class="sub">الاقتناء</div><div class="title">${l.acquisition === 'owned' ? 'مملوك مسبقًا' : 'شراء'} · ${esc(l.date)}${l.accountId ? ' · من ' + esc(acc(l.accountId)?.name || '؟') : ''}</div></div></li>
-        <li class="item"><div class="body"><div class="sub">التكلفة الكاملة</div><div class="title">${l.costBasis === null ? 'مجهولة' : `${plain(l.costBasis, l.currency)} (سعر ${plain(l.cost, l.currency)} + مصنعية ${plain(l.making, l.currency)} + رسوم ${plain(l.fees, l.currency)})`}</div></div></li>
-        ${it.unrealized !== null ? `<li class="item"><div class="body"><div class="sub">ربح/خسارة غير محققة للمتبقي</div><div class="title">${gl(it.unrealized, cur)}</div></div></li>` : ''}
-        ${l.location || l.seller ? `<li class="item"><div class="body"><div class="sub">الحفظ والبائع</div><div class="title">${esc(l.location || '—')}${l.seller ? ' · ' + esc(l.seller) : ''}</div></div></li>` : ''}
-        ${l.resaleDiscount ? `<li class="item"><div class="body"><div class="sub">خصم إعادة البيع المتوقع</div><div class="title">${l.resaleDiscount}%</div></div></li>` : ''}
-        ${l.note ? `<li class="item"><div class="body"><div class="sub">ملاحظات</div><div class="title">${esc(l.note)}</div></div></li>` : ''}
+        ${li('الحيازة', `${esc(Wm.OWNERSHIP[l.ownership || 'owned'])}${l.holder ? ' — ' + esc(l.holder) : ''}`)}
+        ${li('الاقتناء', `${l.acquisition === 'owned' ? 'أصل مملوك سابقًا (لم يُخصم من أي حساب)' : 'شراء'} · ${esc(l.date)}${l.accountId ? ' · من ' + esc(acc(l.accountId)?.name || '؟') : ''}`)}
+        ${li('سعر الشراء بعملته الأصلية', l.costBasis === null ? 'مجهول' : `<b>${plain(l.costBasis, l.currency)}</b> <small>(${esc(ctx.curName(l.currency))}: سعر ${plain(l.cost, l.currency)} + مصنعية ${plain(l.making, l.currency)} + رسوم ${plain(l.fees, l.currency)})</small>`)}
+        ${l.grossGrams && l.grossGrams !== l.grams ? li('الوزن الإجمالي مع الإضافات', `${l.grossGrams} غ`) : ''}
+        ${li('مكان الحفظ', esc(l.location || 'غير محدد'))}
+        ${(l.moves || []).length ? li('سجل النقل', l.moves.map((m) => `${esc(m.date)}: ${esc(m.from || '—')} ← ${esc(m.to)}`).join('<br>')) : ''}
+        ${l.seller ? li('البائع', esc(l.seller)) : ''}${l.note ? li('ملاحظات', esc(l.note)) : ''}
+        ${(l.fixes || []).length ? li('تصحيحات', l.fixes.map((f) => `${esc(f.at.slice(0, 10))}: العملة ${esc(f.from)} ← ${esc(f.to)}`).join('<br>')) : ''}
       </ul>
       ${ctx.attachList ? ctx.attachList('gold', l.id) : ''}
-      <div class="actions">${l.remaining > 0 ? `<button class="btn primary" data-action="gold-sell" data-id="${esc(l.id)}">بيع</button>` : ''}<button class="btn" data-action="gold-edit" data-id="${esc(l.id)}">تعديل</button></div>
-      <h3 style="margin-top:14px">سجل البيع</h3>${sales.length ? `<ul class="list">${sales.map((s) => `<li class="item"><div class="body"><div class="title">${+s.grams.toFixed(3)} غ بـ ${plain(s.net, s.currency)}</div><div class="sub">${esc(s.date)}${s.accountId ? ' · إلى ' + esc(acc(s.accountId)?.name || '؟') : ''} · ${s.realized === null ? 'ربح غير معروف (تكلفة مجهولة)' : `ربح محقق ${plain(s.realized, s.currency)}`}</div></div><button class="btn small ghost-danger" data-action="gold-cancel-sale" data-id="${esc(s.id)}">إلغاء</button></li>`).join('')}</ul>` : '<div class="empty">لا مبيعات</div>'}
-      <div class="actions"><button class="btn small ghost-danger" data-action="gold-delete" data-id="${esc(l.id)}">حذف القطعة…</button></div>`);
+      <div class="actions">${l.remaining > 0 && Wm.isOwnedGold(l) ? `<button class="btn primary" data-action="gold-sell" data-id="${esc(l.id)}">بيع</button>` : ''}<button class="btn" data-action="gold-move" data-id="${esc(l.id)}">نقل مكان الحفظ</button><button class="btn" data-action="gold-edit" data-id="${esc(l.id)}">تعديل</button><button class="btn" data-action="gold-calc-lot" data-id="${esc(l.id)}">احسب قيمتها</button></div>
+      <h3 style="margin-top:14px">سجل البيع</h3>${sales.length ? `<ul class="list">${sales.map((s) => `<li class="item"><div class="body"><div class="title">${+s.grams.toFixed(3)} غ بـ ${plain(s.net, s.currency)}</div><div class="sub">${esc(s.date)}${s.accountId ? ' · إلى ' + esc(acc(s.accountId)?.name || '؟') : ''} · ${s.realized === null ? (l.costBasis === null ? 'ربح غير معروف (تكلفة مجهولة)' : 'ربح غير محسوب (عملة البيع ≠ عملة الشراء)') : `ربح محقق ${plain(s.realized, s.currency)}`}</div></div><button class="btn small ghost-danger" data-action="gold-cancel-sale" data-id="${esc(s.id)}">إلغاء</button></li>`).join('')}</ul>` : '<div class="empty">لا مبيعات</div>'}
+      <div class="actions">${!l.txId && l.costBasis !== null ? `<button class="btn small" data-action="gold-relabel" data-id="${esc(l.id)}">تصحيح عملة الشراء</button>` : ''}${l.remaining <= 0 ? `<button class="btn small" data-action="gold-archive" data-id="${esc(l.id)}">${l.archived ? 'إلغاء الأرشفة' : 'أرشفة'}</button>` : ''}<button class="btn small ghost-danger" data-action="gold-delete" data-id="${esc(l.id)}">حذف القطعة…</button></div>`);
+  }
+  function goldRelabel(id) {
+    const l = S.data.wealth.gold.lots.find((x) => x.id === id); if (!l) return;
+    sheet('تصحيح عملة سعر الشراء', `<p class="muted">المسجل حاليًا: <b>${plain(l.costBasis, l.currency)}</b></p>
+      <p class="hint">إذا أدخلت الرقم بعملة غير صحيحة (مثلًا 2,000,000 وهي بالريال اليمني لكنها حُفظت بالريال السعودي أو الدولار)، اختر العملة الصحيحة. <b>الرقم لا يتغير ولا يُحوَّل</b> — تتغير العملة فقط. يُسجل في سجل التعديلات ويمكن التراجع.</p>
+      <label>العملة الصحيحة</label><select name="currency" required><option value="">— اختر —</option>${currencyOptions('')}</select><div class="cur-echo" id="rlEcho"></div>`, {
+      submit: 'تصحيح العملة', onChange: (f) => { const c = f.elements.currency.value; $('rlEcho').innerHTML = c ? `سيصبح: <b>${plain(l.costBasis, c)}</b>` : ''; },
+      onSubmit: async (v) => { if (!v.currency) throw new C.ValidationError('اختر العملة'); await commit((d) => Wm.relabelGoldCurrency(d, id, v.currency), 'صُححت العملة', { label: `تصحيح عملة ذهب «${l.name}» ${l.currency} ← ${v.currency}` }); goldOpen(id); return false; },
+    });
+  }
+  function goldMove(id) {
+    const l = S.data.wealth.gold.lots.find((x) => x.id === id); if (!l) return;
+    sheet(`نقل «${l.name}»`, `<p class="muted">المكان الحالي: ${esc(l.location || 'غير محدد')}</p><label>المكان الجديد</label><input name="to" required maxlength="90">
+      <label>عند شخص (اختياري)</label><input name="holder" maxlength="90" value="${esc(l.holder || '')}"><label>التاريخ</label><input type="date" name="date" value="${C.today()}"><label>ملاحظة</label><input name="note" maxlength="160">`, {
+      submit: 'نقل', onSubmit: async (v) => { await commit((d) => Wm.moveGold(d, id, v), 'تم النقل', { label: `نقل ذهب «${l.name}» إلى ${v.to}` }); goldOpen(id); return false; },
+    });
   }
   function goldSell(id) {
     const l = S.data.wealth.gold.lots.find((x) => x.id === id); if (!l) return;
-    const cur = l.currency;
     sheet(`بيع من «${l.name}»`, `
       <p class="muted">المتبقي ${+l.remaining.toFixed(3)} غ ${esc(Wm.karatLabel(l))}</p>
       <label>الوزن المباع (غ)</label><input name="grams" inputmode="decimal" value="${esc(l.remaining)}" required>
-      <label>مبلغ البيع (${esc(cur)})</label><input name="proceeds" class="amount-input" inputmode="decimal" required>
+      <div class="grid2" style="grid-template-columns:3fr 2fr"><div><label>مبلغ البيع</label><input name="proceeds" class="amount-input" inputmode="decimal" required></div><div><label>العملة</label><select name="currency" required><option value="">— اختر —</option>${currencyOptions(l.currency || '')}</select></div></div>
       <label>رسوم البيع (اختياري)</label><input name="fees" inputmode="decimal" placeholder="0">
       <label>استُلم في حساب</label><select name="accountId">${accOpts('', { none: 'بدون — لم يدخل حساباتي في فلوسي' })}</select>
       <div id="gsR" hidden><label id="gsRL"></label><input name="received" inputmode="decimal"></div>
@@ -218,14 +243,10 @@ export function register(ctx) {
       <div class="hint" id="gsH"></div>`, {
       submit: 'تسجيل البيع',
       onChange: (form) => {
-        const gm = C.parseAmount(form.elements.grams.value), pr = C.parseAmount(form.elements.proceeds.value), fe = C.parseAmount(form.elements.fees.value) || 0;
-        const mkt = Wm.gramPrice(S.data.market, cur, S.rates, l.purity);
-        const a = acc(form.elements.accountId.value), diff = a && a.currency !== cur;
+        const E = form.elements, gm = C.parseAmount(E.grams.value), pr = C.parseAmount(E.proceeds.value), fe = C.parseAmount(E.fees.value) || 0, c = E.currency.value;
+        const a = acc(E.accountId.value), diff = a && c && a.currency !== c;
         $('gsR').hidden = !diff; if (diff) $('gsRL').textContent = `المبلغ المستلم فعلًا بـ ${a.currency}`;
-        const parts = [];
-        if (mkt !== null && gm > 0) parts.push(`قيمة هذا الوزن بالسعر الفوري ≈ ${plain(mkt * gm, cur)} (سعر المحل عادة أقل).`);
-        if (l.costBasis !== null && gm > 0 && pr > 0) { const c = l.costBasis * (gm / l.grams); parts.push(`تكلفة هذا الجزء ${plain(c, cur)} ← ربح محقق ${plain(pr - fe - c, cur)}.`); }
-        $('gsH').textContent = parts.join(' ');
+        $('gsH').innerHTML = !c ? '' : l.costBasis !== null && c === l.currency && gm > 0 && pr > 0 ? `تكلفة هذا الجزء ${plain(l.costBasis * (gm / l.grams), c)} ← ربح محقق ${plain(pr - fe - l.costBasis * (gm / l.grams), c)}.` : l.costBasis !== null && c !== l.currency ? 'عملة البيع تختلف عن عملة الشراء — لن يُحسب ربح محقق (لا تحويل ضمني).' : '';
       },
       onSubmit: async (v) => { await commit((d) => Wm.sellGold(d, l.id, v), 'تم تسجيل البيع', { label: `بيع ${v.grams}غ من «${l.name}»` }); goldOpen(l.id); return false; },
     });
@@ -233,12 +254,82 @@ export function register(ctx) {
   async function goldDelete(id) {
     const l = S.data.wealth.gold.lots.find((x) => x.id === id); if (!l) return;
     const eff = Wm.goldDeleteEffects(S.data, id);
-    if (!eff.linked) { if (await confirmBox({ title: 'حذف القطعة؟', text: `«${l.name}» ليست مرتبطة بأي حركة على حساباتك، وحذفها يزيلها من ثروتك فقط. يمكنك التراجع.`, ok: 'حذف', danger: true })) { await commit((d) => Wm.deleteGoldLot(d, id), 'تم الحذف', { label: `حذف ذهب «${l.name}»` }); closeSheet(); } return; }
+    if (!eff.linked) { if (await confirmBox({ title: 'حذف القطعة؟', text: `«${l.name}» ليست مرتبطة بأي حركة على حساباتك. يمكنك التراجع.`, ok: 'حذف', danger: true })) { await commit((d) => Wm.deleteGoldLot(d, id), 'تم الحذف', { label: `حذف ذهب «${l.name}»` }); closeSheet(); } return; }
     sheet(`حذف «${l.name}»`, `<div class="notice">لهذه القطعة ${eff.linked} حركة على حساباتك (شراء${eff.sales ? ` و${eff.sales} بيع` : ''}). اختر مصيرها:</div>
       <button class="btn block" id="gdKeep">حذف القطعة فقط — إبقاء الحركات والأرصدة كما هي</button><p class="hint">مناسب إن كانت القطعة سُجلت مرتين بالخطأ والمال خرج فعلًا.</p>
       <button class="btn ghost-danger block" id="gdRev" style="margin-top:10px">حذف القطعة وحركاتها (يعود المال للحساب)</button><p class="hint">فقط إن لم يحدث الشراء/البيع فعلًا.</p>`);
     $('gdKeep').onclick = async () => { await commit((d) => Wm.deleteGoldLot(d, id, { mode: 'keep' }), 'تم الحذف', { label: `حذف ذهب «${l.name}» (مع إبقاء الحركات)` }); closeSheet(); };
     $('gdRev').onclick = async () => { if (!(await confirmBox({ title: 'حذف مع عكس الحركات؟', text: 'ستُحذف حركات الشراء والبيع المرتبطة وتعود الأرصدة كما كانت قبلها.', ok: 'حذف وعكس', danger: true }))) return; await commit((d) => Wm.deleteGoldLot(d, id, { mode: 'reverse' }), 'تم الحذف', { label: `حذف ذهب «${l.name}» مع حركاته`, snapshot: 'pre-fix' }); closeSheet(); };
+  }
+
+  // ---------- حاسبة الذهب (يدوية، لا تغيّر أي بيانات) ----------
+  S.gcalc ||= { scope: 'all', lotId: '', grams: '', karat: '21', purity: '', market: 'SA', marketLabel: '', currency: '', basis: 'karat', side: 'sell', prices: {}, fees: '', discountPct: '' };
+  function calcItems(st) {
+    const lots = S.data.wealth.gold.lots.filter((l) => Wm.isOwnedGold(l) && l.remaining > 0);
+    if (st.scope === 'manual') { const g = C.parseAmount(st.grams); if (!(g > 0)) return []; let purity; try { purity = Wm.purityOf({ karat: st.karat, purity: st.purity }); } catch { return []; } return [{ name: 'وزن يدوي', grams: g, karat: st.karat === 'custom' ? 'custom' : Number(st.karat), purity }]; }
+    if (st.scope === 'lot') return Wm.lotItems(lots.filter((l) => l.id === st.lotId));
+    if (st.scope.startsWith('k:')) return Wm.lotItems(lots.filter((l) => (Wm.KARATS.includes(Number(l.karat)) ? String(l.karat) : 'p' + Math.round(l.purity * 1000)) === st.scope.slice(2)));
+    return Wm.lotItems(lots);
+  }
+  function renderGoldCalc() {
+    const st = S.gcalc, lots = S.data.wealth.gold.lots.filter((l) => Wm.isOwnedGold(l) && l.remaining > 0);
+    const items = calcItems(st), keys = st.basis === '24' ? ['24'] : [...new Set(items.map((i) => (Wm.KARATS.includes(Number(i.karat)) ? String(i.karat) : 'p' + Math.round(i.purity * 1000))))];
+    let res = null, err = '';
+    if (st.currency && items.length) { try { res = Wm.goldCalc(items, { prices: st.prices, basis: st.basis, currency: st.currency, fees: st.fees, discountPct: st.discountPct }); } catch (e) { err = ctx.errText(e); } }
+    const yemen = st.market.startsWith('YE'), online = !!S.data.settings.goldOnline, g = S.data.market?.gold;
+    const kl = (k) => (k.startsWith('p') ? `نقاء ${Number(k.slice(1)) / 10}%` : `عيار ${k}`);
+    $('v-gold-calc').innerHTML = `${head('حاسبة الذهب', 'gold')}
+      <div class="notice info">حاسبة يدوية: تدخل سعر الجرام بنفسك فتظهر القيمة التقديرية. <b>لا تغيّر أي بيانات</b> — لا الكميات ولا أسعار الشراء ولا الأرصدة — إلا إذا اخترت «حفظ التقييم».</div>
+      <div class="card"><label>ماذا تحسب؟</label><select id="gcScope"><option value="all">كل ذهبي المملوك (${lots.length} قطعة)</option>${[...new Set(lots.map((l) => (Wm.KARATS.includes(Number(l.karat)) ? String(l.karat) : 'p' + Math.round(l.purity * 1000))))].map((k) => `<option value="k:${k}">كل قطع ${kl(k)}</option>`).join('')}<option value="lot">قطعة واحدة</option><option value="manual">وزن أدخله يدويًا</option></select>
+        <div id="gcLot" ${st.scope === 'lot' ? '' : 'hidden'}><label>القطعة</label><select id="gcLotSel">${lots.map((l) => `<option value="${esc(l.id)}"${l.id === st.lotId ? ' selected' : ''}>${esc(l.name)} — ${+l.remaining.toFixed(3)} غ ${esc(Wm.karatLabel(l))}</option>`).join('')}</select></div>
+        <div id="gcMan" class="grid2" ${st.scope === 'manual' ? '' : 'hidden'}><div><label>الوزن (غ)</label><input id="gcGrams" inputmode="decimal" value="${esc(st.grams)}"></div><div><label>العيار</label><select id="gcKarat">${Wm.KARATS.map((k) => `<option${String(k) === st.karat ? ' selected' : ''}>${k}</option>`).join('')}<option value="custom"${st.karat === 'custom' ? ' selected' : ''}>مخصص</option></select></div></div>
+        <div id="gcPur" ${st.scope === 'manual' && st.karat === 'custom' ? '' : 'hidden'}><label>النقاء</label><input id="gcPurity" inputmode="decimal" value="${esc(st.purity)}"></div>
+        <div class="grid2"><div><label>السوق</label><select id="gcMarket">${Object.entries(Wm.GOLD_MARKETS).map(([k, v]) => `<option value="${k}"${k === st.market ? ' selected' : ''}>${v.label}</option>`).join('')}</select></div>
+          <div><label>العملة</label><select id="gcCur"><option value="">— اختر —</option>${currencyOptions(st.currency)}</select></div></div>
+        <div id="gcML" ${st.market === 'custom' ? '' : 'hidden'}><label>اسم السوق/البلد</label><input id="gcMarketLabel" maxlength="60" value="${esc(st.marketLabel)}"></div>
+        <label>السعر الذي ستدخله</label><div class="seg"><button data-gc-basis="karat" aria-pressed="${st.basis === 'karat'}">لنفس العيار</button><button data-gc-basis="24" aria-pressed="${st.basis === '24'}">سعر عيار 24</button></div>
+        <label>نوع السعر</label><div class="seg"><button data-gc-side="sell" aria-pressed="${st.side === 'sell'}">سعر البيع للمحل</button><button data-gc-side="buy" aria-pressed="${st.side === 'buy'}">سعر الشراء من المحل</button></div>
+        <p class="hint" style="margin-top:4px">${st.side === 'sell' ? 'كم سيدفع لك المحل إن بعت.' : 'كم ستدفع لو اشتريت نفس الذهب اليوم.'}</p>
+        ${keys.map((k) => `<label>سعر جرام ${kl(k)}${st.currency ? ` (${esc(st.currency)})` : ''}</label><input data-gc-price="${k}" inputmode="decimal" value="${esc(st.prices[k] || '')}">`).join('')}
+        <div class="grid2"><div><label>${st.side === 'sell' ? 'خصم المحل %' : 'زيادة/خصم %'}</label><input id="gcDisc" inputmode="decimal" placeholder="0" value="${esc(st.discountPct)}"></div><div><label>رسوم ثابتة</label><input id="gcFees" inputmode="decimal" placeholder="0" value="${esc(st.fees)}"></div></div>
+        ${yemen ? '<p class="hint">لا يوجد سعر موحد لكل اليمن: أدخل سعر سوق ' + esc(Wm.GOLD_MARKETS[st.market].label.split('— ')[1]) + ' الذي تتعامل به، بالريال اليمني عادة.</p>' : ''}
+        <details style="margin-top:10px"${online ? ' open' : ''}><summary class="muted">اقتراح سعر من الإنترنت (مغلق افتراضيًا)</summary>
+          <label class="check"><input type="checkbox" id="gcOnline" ${online ? 'checked' : ''}> السماح باقتراح سعر عالمي من الإنترنت</label>
+          ${online ? `<button class="btn small" id="gcSuggest" ${st.currency ? '' : 'disabled'}>اقترح سعر جرام 24 بالسعر العالمي</button>
+            ${g?.usdPerOz ? `<p class="hint">آخر سعر عالمي: ${plain(g.usdPerOz, 'USD')} للأونصة — ${esc(g.sourceName || 'Gold API')} — ${esc(dt(g.fetchedAt))}</p>` : ''}
+            <p class="hint"><b>سعر عالمي نظري (Spot)</b> للذهب الخالص، وليس سعر محلات ${yemen ? 'صنعاء أو عدن' : 'السوق المحلي'}، ولا يشمل المصنعية، ولا يميز بين سعر البيع والشراء. الاقتراح يملأ الخانة فقط ولا يُحفظ.</p>` : '<p class="hint">عند التفعيل يُجلب السعر العالمي من gold-api.com عند ضغطك فقط.</p>'}</details></div>
+      <div class="card"><h3>النتيجة التقديرية</h3>
+        ${!items.length ? '<div class="empty">لا يوجد ذهب للحساب</div>' : !st.currency ? '<div class="empty">اختر العملة</div>' : err ? `<p class="bad">${esc(err)}</p>` : `
+          <ul class="list">${res.lines.map((x) => `<li class="item"><div class="body"><div class="title">${esc(x.name)}</div><div class="sub">${+x.grams.toFixed(3)} غ × ${x.pricePerGram === null ? '<span class="bad">بلا سعر</span>' : plain(x.pricePerGram, st.currency)}${x.how ? ' · ' + esc(x.how) : ''}</div></div><div class="amt">${x.value === null ? '—' : money(x.value, st.currency)}</div></li>`).join('')}</ul>
+          <div class="kpis" style="margin-top:8px"><div><small>الإجمالي</small><b>${money(res.gross, st.currency)}</b></div><div><small>خصم/رسوم</small><b>${money(res.discount + res.fees, st.currency)}</b></div><div><small>${st.side === 'sell' ? 'صافي البيع التقديري' : 'قيمة الشراء التقديرية'}</small><b class="good">${money(res.net, st.currency)}</b></div></div>
+          ${res.missing.length ? `<p class="hint bad">بعض العيارات بلا سعر ولم تُحسب.</p>` : ''}
+          <div class="actions"><button class="btn" id="gcCopy">نسخ النتيجة</button><button class="btn primary" id="gcSave">حفظ كتقييم بتاريخ اليوم…</button></div>`}</div>
+      ${(S.data.wealth.gold.valuations || []).length ? `<div class="card"><h3>تقييمات محفوظة</h3><ul class="list">${[...S.data.wealth.gold.valuations].reverse().map((v) => `<li class="item"><div class="body"><div class="title">${esc(v.date)} — ${esc(v.marketLabel)} ${v.approved ? '<span class="tag">معتمد في ثروتي</span>' : ''}</div><div class="sub">${Object.entries(v.prices).map(([k, p]) => `${kl(k)}: ${plain(p, v.currency)}`).join(' · ')} · ${v.basis === '24' ? 'على أساس 24' : 'لنفس العيار'}${v.source === 'online' ? ' · اقتراح عالمي' : ''}</div></div><button class="btn small" data-action="gval-approve" data-id="${esc(v.id)}">${v.approved ? 'إلغاء الاعتماد' : 'اعتماد'}</button><button class="btn small ghost-danger" data-action="gval-del" data-id="${esc(v.id)}">حذف</button></li>`).join('')}</ul>
+        <p class="hint">التقييم المعتمد فقط يدخل في «ثروتي» وحاسبة الزكاة، بأسعاره وتاريخه، ويُطبق على الكميات الحالية.</p></div>` : ''}`;
+    const set = (k, v, re = true) => { S.gcalc = { ...S.gcalc, [k]: v }; if (re) { const fid = document.activeElement?.id || document.activeElement?.dataset?.gcPrice, pos = document.activeElement?.selectionStart; renderGoldCalc(); const el = $(fid) || document.querySelector(`[data-gc-price="${fid}"]`); if (el) { el.focus(); try { el.setSelectionRange(pos, pos); } catch {} } } };
+    $('gcScope').value = st.scope; $('gcScope').onchange = (e) => set('scope', e.target.value);
+    $('gcLotSel') && ($('gcLotSel').onchange = (e) => set('lotId', e.target.value)); if (st.scope === 'lot' && !st.lotId && lots[0]) S.gcalc.lotId = lots[0].id;
+    $('gcGrams').oninput = (e) => set('grams', e.target.value); $('gcKarat').onchange = (e) => set('karat', e.target.value); $('gcPurity').oninput = (e) => set('purity', e.target.value);
+    $('gcMarket').onchange = (e) => { const m = Wm.GOLD_MARKETS[e.target.value]; S.gcalc.market = e.target.value; if (m.currency && !S.gcalc.currency) S.gcalc.currency = m.currency; renderGoldCalc(); };
+    $('gcCur').onchange = (e) => set('currency', e.target.value); $('gcMarketLabel').oninput = (e) => set('marketLabel', e.target.value, false);
+    $('v-gold-calc').querySelectorAll('[data-gc-basis]').forEach((b) => (b.onclick = () => set('basis', b.dataset.gcBasis)));
+    $('v-gold-calc').querySelectorAll('[data-gc-side]').forEach((b) => (b.onclick = () => set('side', b.dataset.gcSide)));
+    $('v-gold-calc').querySelectorAll('[data-gc-price]').forEach((i) => (i.oninput = () => set('prices', { ...S.gcalc.prices, [i.dataset.gcPrice]: i.value })));
+    $('gcDisc').oninput = (e) => set('discountPct', e.target.value); $('gcFees').oninput = (e) => set('fees', e.target.value);
+    $('gcOnline').onchange = (e) => commit((d) => { d.settings.goldOnline = e.target.checked; }, null, { history: false });
+    $('gcSuggest') && ($('gcSuggest').onclick = async () => {
+      try {
+        // في سوق يمني بالريال اليمني: التحويل بسعر صرف ذلك السوق (صنعاء/عدن) كما أدخلته، لا بسعر الصرف العام
+        let r = S.rates;
+        if (st.currency === 'YER' && st.market.startsWith('YE')) { const k = st.market === 'YE-ADEN' ? 'aden' : 'sanaa'; if (!(Number(S.rates?.yer?.[k]?.value) > 0)) throw new C.ValidationError(`أدخل سعر الريال اليمني في ${k === 'aden' ? 'عدن' : 'صنعاء'} أولًا (الإعدادات ← سعر الريال اليمني) — لا نستخدم سعرًا عامًا لليمن`); r = C.withYerMarket(S.rates, k); }
+        const gq = await suggestGoldOnline(); const p = Wm.gramPrice({ gold: gq }, st.currency, r); if (p === null) throw new C.ValidationError(`لا يوجد سعر صرف لـ ${st.currency}`); S.gcalc.basis = '24'; S.gcalc.prices = { ...S.gcalc.prices, 24: String(+p.toFixed(2)) }; S.gcalc.suggested = true; renderGoldCalc(); toast('اقتراح عالمي نظري — راجعه قبل الاعتماد'); }
+      catch (e) { toast(ctx.errText(e), true); }
+    });
+    $('gcCopy') && ($('gcCopy').onclick = () => { const t = `حاسبة الذهب — ${C.today()} — ${Wm.GOLD_MARKETS[st.market].label}${st.marketLabel ? ' ' + st.marketLabel : ''}\n` + res.lines.map((x) => `${x.name}: ${x.grams} غ × ${x.pricePerGram ?? '—'} = ${x.value ?? '—'} ${st.currency}`).join('\n') + `\nالصافي التقديري: ${res.net} ${st.currency} (تقدير وليس سعرًا رسميًا)`; navigator.clipboard?.writeText(t).then(() => toast('تم النسخ'), () => toast('تعذر النسخ', true)); });
+    $('gcSave') && ($('gcSave').onclick = async () => {
+      const approve = await confirmBox({ title: 'حفظ التقييم', text: `سيُحفظ تقييم بأسعارك بتاريخ ${C.today()} (${Wm.GOLD_MARKETS[st.market].label}، ${st.currency}). هل تريد اعتماده ليظهر في «ثروتي» وحاسبة الزكاة؟ لن يغيّر أي قطعة أو سعر شراء أو رصيد.`, ok: 'حفظ واعتماد', cancel: 'حفظ فقط' });
+      await commit((d) => Wm.saveGoldValuation(d, { ...st, source: st.suggested ? 'online' : 'manual', approve }), approve ? 'حُفظ التقييم واعتُمد' : 'حُفظ التقييم (غير معتمد)', { label: `تقييم ذهب ${C.today()}` }); renderGoldCalc();
+    });
   }
 
   // ---------- الأسهم والصناديق ----------
@@ -440,16 +531,21 @@ export function register(ctx) {
 
   // ---------- الزكاة ----------
   function renderZakat() {
-    const o = { ...Wm.ZAKAT_DEFAULTS, ...(S.data.settings.zakat || {}), silverUsdPerOz: S.data.market?.silver?.usdPerOz || null };
+    const o = { ...Wm.ZAKAT_DEFAULTS, ...(S.data.settings.zakat || {}) };
     const z = Wm.zakatEstimate(S.data, o, S.rates), cur = disp();
     const sel = (name, opts) => `<select data-zk="${name}">${opts.map(([v, l]) => `<option value="${v}"${String(o[name]) === String(v) ? ' selected' : ''}>${l}</option>`).join('')}</select>`;
     $('v-zakat').innerHTML = `${head('حاسبة الزكاة (تقديرية)', 'wealth')}
       <div class="notice"><b>تقدير للمساعدة فقط وليس فتوى.</b> أحكام الزكاة تختلف بحسب نوع الأصل والغرض من امتلاكه والمذهب. راجع الحساب يدويًا واستشر جهة شرعية موثوقة.</div>
       <div class="card"><div class="kpis"><div><small>الوعاء الزكوي</small><b>${money(z.base, cur)}</b></div><div><small>النصاب (${z.nisabBasis === 'gold' ? '85 غ ذهب' : '595 غ فضة'})</small><b>${z.nisab === null ? '—' : money(z.nisab, cur)}</b></div><div><small>الزكاة التقديرية</small><b class="good">${money(z.due, cur)}</b></div></div>
-        <p class="hint" style="margin-bottom:0">${z.nisab === null ? 'لا يتوفر سعر الذهب/الفضة لحساب النصاب — حدّث الأسعار.' : z.reached ? `بلغ النصاب. النسبة ${z.rate}%.` : 'لم يبلغ النصاب.'} ${o.hawlDate ? (z.hawlDone ? `اكتمل الحول (بدأ ${esc(o.hawlDate)}).` : `يكتمل الحول في ${esc(z.hawlEnds)} تقريبًا (سنة هجرية ≈ 354 يومًا).`) : 'حدد تاريخ بداية الحول.'}${z.deducted ? ` خُصمت ديون ${plain(z.deducted, cur)}.` : ''}</p></div>
+        <p class="hint" style="margin-bottom:0">${z.nisab === null ? 'النصاب غير محسوب: أدخل سعر جرام ' + (o.nisabBasis === 'silver' ? 'الفضة' : 'الذهب 24') + ' أدناه (أو اعتمد تقييمًا بسعر عيار 24 من حاسبة الذهب).' : z.reached ? `بلغ النصاب. النسبة ${z.rate}%.` : 'لم يبلغ النصاب.'} ${o.hawlDate ? (z.hawlDone ? `اكتمل الحول (بدأ ${esc(o.hawlDate)}).` : `يكتمل الحول في ${esc(z.hawlEnds)} تقريبًا (سنة هجرية ≈ 354 يومًا).`) : 'حدد تاريخ بداية الحول.'}${z.deducted ? ` خُصمت ديون ${plain(z.deducted, cur)}.` : ''}</p></div>
       <div class="card"><h3>الإعدادات</h3>
         <label>بداية الحول</label><input type="date" data-zk="hawlDate" value="${esc(o.hawlDate || '')}">
         <label>أساس النصاب</label>${sel('nisabBasis', [['gold', 'الذهب (85 غ)'], ['silver', 'الفضة (595 غ)']])}
+        <label>سعر جرام ${o.nisabBasis === 'silver' ? 'الفضة' : 'الذهب 24'} للنصاب (${esc(cur)}) ${z.nisabSource === 'valuation' ? '— مأخوذ حاليًا من تقييمك المعتمد' : ''}</label><input data-zk="nisabPrice" inputmode="decimal" placeholder="أدخل السعر يدويًا" value="${esc(o.nisabPrice || '')}">
+        <label>قيمة الذهب في الزكاة</label>${sel('goldPricing', [['valuation', 'من التقييم المعتمد في حاسبة الذهب'], ['manual', 'أسعار أدخلها هنا للزكاة فقط']])}
+        ${o.goldPricing === 'manual' ? `<div class="grid2"><div><label>عملة الأسعار</label><select data-zkm="currency"><option value="">— اختر —</option>${currencyOptions(o.manualGold?.currency || '')}</select></div><div></div></div>
+          ${[...new Set(S.data.wealth.gold.lots.filter((l) => Wm.isOwnedGold(l) && l.remaining > 0).map((l) => (Wm.KARATS.includes(Number(l.karat)) ? String(l.karat) : 'p' + Math.round(l.purity * 1000))))].map((k) => `<label>سعر جرام ${k.startsWith('p') ? 'نقاء ' + Number(k.slice(1)) / 10 + '%' : 'عيار ' + k}</label><input data-zkp="${k}" inputmode="decimal" value="${esc(o.manualGold?.prices?.[k] || '')}">`).join('')}` : !Wm.approvedValuation(S.data) && S.data.wealth.gold.lots.some((l) => l.remaining > 0) ? '<p class="hint">لا يوجد تقييم معتمد: الذهب لن يُحسب في الزكاة حتى تقيّمه أو تدخل أسعارًا هنا.</p>' : ''}
+        ${z.unvaluedGold ? `<p class="hint bad">${z.unvaluedGold} قطعة ذهب غير مقيمة ولم تُحسب.</p>` : ''}
         <label>الذهب المستعمل للزينة (مشغولات)</label>${sel('jewelry', [['exclude', 'لا يُزكى (رأي الجمهور)'], ['include', 'يُزكى (رأي الحنفية)']])}
         <label>الأسهم</label>${sel('stocks', [['market', 'للمتاجرة: كامل القيمة السوقية'], ['ratio', 'للاستثمار الطويل: نسبة الأصول الزكوية'], ['exclude', 'لا أُزكيها (تُخرج الشركة الزكاة)']])}
         <div ${o.stocks === 'ratio' ? '' : 'hidden'}><label>نسبة الأصول الزكوية التقريبية %</label><input data-zk="stocksRatio" inputmode="decimal" value="${esc(o.stocksRatio)}"></div>
@@ -459,18 +555,26 @@ export function register(ctx) {
         <label>الديون التي عليك</label>${sel('debts', [['due', 'تُخصم المستحقة خلال سنة'], ['all', 'تُخصم كلها'], ['none', 'لا تُخصم']])}</div>
       <div class="card"><h3>تفصيل الحساب</h3><ul class="list">${z.lines.map((l) => `<li class="item"><div class="body"><div class="title">${esc(l.label)} ${l.included ? '' : '<span class="tag">غير محسوب</span>'}</div><div class="sub" style="white-space:normal">${esc(l.note)}</div></div><div class="amt">${money(l.amount, cur)}</div></li>`).join('') || '<li class="empty">لا أصول</li>'}</ul></div>`;
     $('v-zakat').querySelectorAll('[data-zk]').forEach((el) => (el.onchange = () => {
-      const z2 = { ...(S.data.settings.zakat || {}) }; z2[el.dataset.zk] = el.type === 'date' ? el.value : el.dataset.zk === 'stocksRatio' ? Math.min(100, Math.max(0, C.parseAmount(el.value) || 0)) : el.value;
+      const z2 = { ...(S.data.settings.zakat || {}) }; z2[el.dataset.zk] = el.type === 'date' ? el.value : el.dataset.zk === 'stocksRatio' ? Math.min(100, Math.max(0, C.parseAmount(el.value) || 0)) : el.dataset.zk === 'nisabPrice' ? (C.parseAmount(el.value) > 0 ? C.parseAmount(el.value) : null) : el.value;
       commit((d) => { d.settings.zakat = z2; }, null, { history: false }).then(renderZakat);
     }));
+    const saveManual = (fn) => { const z2 = { ...(S.data.settings.zakat || {}) }; const m = { currency: '', basis: 'karat', prices: {}, ...(z2.manualGold || {}) }; m.prices = { ...m.prices }; fn(m); z2.manualGold = m; commit((d) => { d.settings.zakat = z2; }, null, { history: false }).then(renderZakat); };
+    $('v-zakat').querySelectorAll('[data-zkm]').forEach((el) => (el.onchange = () => saveManual((m) => { m.currency = el.value; })));
+    $('v-zakat').querySelectorAll('[data-zkp]').forEach((el) => (el.onchange = () => saveManual((m) => { const n = C.parseAmount(el.value); if (n > 0) m.prices[el.dataset.zkp] = n; else delete m.prices[el.dataset.zkp]; })));
   }
 
   return {
-    views: { wealth: renderWealth, gold: renderGold, stocks: renderStocks, investments: renderInvestments, performance: renderPerformance, zakat: renderZakat },
-    nav: { wealth: 'wealth', gold: 'wealth', stocks: 'wealth', investments: 'wealth', performance: 'wealth', zakat: 'wealth' },
+    views: { wealth: renderWealth, gold: renderGold, 'gold-calc': renderGoldCalc, stocks: renderStocks, investments: renderInvestments, performance: renderPerformance, zakat: renderZakat },
+    nav: { wealth: 'wealth', gold: 'wealth', 'gold-calc': 'wealth', stocks: 'wealth', investments: 'wealth', performance: 'wealth', zakat: 'wealth' },
     actions: {
       'refresh-prices': () => refreshPrices(true),
       'wealth-debts': (b) => { S.debtTab = b.dataset.type; go('debts'); },
       'gold-add': () => goldForm(), 'gold-open': (b, id) => goldOpen(id), 'gold-edit': (b, id) => goldForm(id), 'gold-sell': (b, id) => goldSell(id), 'gold-delete': (b, id) => goldDelete(id),
+      'gold-move': (b, id) => goldMove(id), 'gold-relabel': (b, id) => goldRelabel(id),
+      'gold-archive': async (b, id) => { const l = S.data.wealth.gold.lots.find((x) => x.id === id); await commit((d) => Wm.setGoldArchived(d, id, !l.archived), l.archived ? 'أُلغيت الأرشفة' : 'تمت الأرشفة', { label: `${l.archived ? 'إلغاء أرشفة' : 'أرشفة'} ذهب «${l.name}»` }); goldOpen(id); },
+      'gold-calc-lot': (b, id) => { S.gcalc = { ...S.gcalc, scope: 'lot', lotId: id }; closeSheet(); go('gold-calc'); },
+      'gval-approve': async (b, id) => { const v = S.data.wealth.gold.valuations.find((x) => x.id === id); await commit((d) => Wm.setValuationApproved(d, id, !v.approved), v.approved ? 'أُلغي الاعتماد' : 'اعتُمد التقييم في ثروتي', { label: `${v.approved ? 'إلغاء اعتماد' : 'اعتماد'} تقييم ذهب ${v.date}` }); },
+      'gval-del': async (b, id) => { if (await confirmBox({ title: 'حذف التقييم؟', text: 'لا يؤثر على الذهب أو الأرصدة. يمكنك التراجع.', ok: 'حذف', danger: true })) await commit((d) => Wm.deleteGoldValuation(d, id), 'تم الحذف', { label: 'حذف تقييم ذهب' }); },
       'gold-cancel-sale': async (b, id) => {
         const s = S.data.wealth.gold.sales.find((x) => x.id === id); if (!s) return;
         if (!(await confirmBox({ title: 'إلغاء البيع؟', text: `يعود ${s.grams} غ للقطعة${s.txId ? `، وتُحذف حركة المتحصل (${plain(s.net, s.currency)}) من «${acc(s.accountId)?.name || ''}»` : ''}. يمكنك التراجع.`, ok: 'إلغاء البيع', cancel: 'رجوع', danger: true }))) return;

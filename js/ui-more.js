@@ -95,7 +95,7 @@ export function register(ctx) {
   }
   ctx.onStart ||= [];
   ctx.onStart.push(() => {
-    try { S.integrityCount = [...C.diagnose(S.data, { rates: S.rates }), ...ctx.extraDiagnostics.flatMap((fn) => fn(S.data) || [])].filter((x) => x.severity !== 'info').length; } catch {}
+    try { S.integrityCount = [...C.diagnose(S.data, { rates: S.rates }), ...ctx.extraDiagnostics.flatMap((fn) => { try { return fn(S.data, S.rates) || []; } catch { return []; } })].filter((x) => x.severity !== 'info').length; } catch {}
     updateBell(); notifyNew();
     clearInterval(S.alertTimer); S.alertTimer = setInterval(() => { if (S.data && document.visibilityState === 'visible') { updateBell(); notifyNew(); } }, 5 * 60 * 1000);
   });

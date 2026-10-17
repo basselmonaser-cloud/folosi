@@ -389,10 +389,11 @@ export function withYerMarket(rates, market) {
 
 export function periodSummary(data, { from, to }, rates, display = data.settings.displayCurrency) {
   const inc = makeTotaler(display, rates), exp = makeTotaler(display, rates);
-  const byCat = { income: {}, expense: {} }; const missing = new Set();
+  const byCat = { income: {}, expense: {} }; const missing = new Set(), byCur = {};
   for (const t of data.transactions) {
     if (!reportable(t) || t.date < from || t.date > to) continue;
     (t.type === 'income' ? inc : exp).add(t.amount, t.currency);
+    const bc = (byCur[t.currency] ||= { income: 0, expense: 0 }); bc[t.type] = round(bc[t.type] + t.amount, t.currency);
     const v = convert(t.amount, t.currency, display, rates);
     if (v === null) { missing.add(t.currency); continue; }
     byCat[t.type][t.category] = (byCat[t.type][t.category] || 0) + v;
@@ -400,7 +401,9 @@ export function periodSummary(data, { from, to }, rates, display = data.settings
   const i = inc.result(), e = exp.result();
   for (const c of [...i.missing, ...e.missing]) missing.add(c);
   const cats = (o) => Object.entries(o).map(([name, value]) => ({ name, value: round(value, display) })).sort((a, b) => b.value - a.value);
-  return { income: i.total, expense: e.total, net: round(i.total - e.total, display), byCategory: { income: cats(byCat.income), expense: cats(byCat.expense) }, missing: [...missing] };
+  // byCurrency: المبالغ بعملاتها الأصلية (بلا تحويل) — المجموع المحوَّل أعلاه تقدير بسعر اليوم
+  const byCurrency = Object.entries(byCur).map(([currency, v]) => ({ currency, income: v.income, expense: v.expense, net: round(v.income - v.expense, currency) }));
+  return { income: i.total, expense: e.total, net: round(i.total - e.total, display), byCategory: { income: cats(byCat.income), expense: cats(byCat.expense) }, byCurrency, converted: byCurrency.some((x) => x.currency !== display), missing: [...missing] };
 }
 export const monthRange = (m) => {
   const [y, mo] = m.split('-').map(Number);
@@ -996,6 +999,24 @@ export function diagnose(data, { rates } = {}) {
   // 8) أسماء حسابات مكررة
   const names = {}; for (const a of data.accounts) if (!a.archived) (names[a.name] ||= []).push(a);
   for (const [n, list] of Object.entries(names)) if (list.length > 1) add('info', 'same-name', `أكثر من حساب نشط باسم «${n}»`, 'قد يسبب اختيار الحساب الخطأ عند التسجيل.', null);
+  // 9) العملات: حركة بعملة غير عملة حسابها، تحويل بسعر غير منطقي، مبلغ أصلي × السعر ≠ المبلغ
+  for (const t of data.transactions) { const a = acc(t.accountId); if (a && t.currency && t.currency !== a.currency) add('error', 'currency-mismatch', `حركة بعملة ${t.currency} على حساب بـ ${a.currency}`, `${t.category} ${t.amount} بتاريخ ${t.date} — قد يكون مبلغًا محفوظًا بعملة خاطئة.`, null); }
+  for (const t of data.transactions) if (t.origCurrency && t.origAmount > 0) {
+    const a = acc(t.accountId); if (!a) continue;
+    if (Number(t.rate) > 0 && Math.abs(t.origAmount * t.rate - t.amount) > Math.max(0.02, t.amount * 0.005)) add('warn', 'fx-mismatch', 'المبلغ المحوَّل لا يطابق السعر المسجل', `${t.origAmount} ${t.origCurrency} × ${t.rate} ≠ ${t.amount} ${a.currency} (${t.category}، ${t.date}).`, null);
+    fxCheck(t.origAmount, t.origCurrency, t.amount, a.currency, `${t.category} بتاريخ ${t.date}`);
+  }
+  for (const t of data.transfers) { const fa = acc(t.from), ta = acc(t.to); if (fa && ta && fa.currency !== ta.currency) fxCheck(Number(t.fromAmount ?? t.amount), fa.currency, Number(t.toAmount ?? t.amount), ta.currency, `تحويل ${fa.name} ← ${ta.name} بتاريخ ${t.date}`); }
+  function fxCheck(fromAmt, fromCur, toAmt, toCur, where) {
+    if (!(fromAmt > 0 && toAmt > 0)) return;
+    // ريال يمني مقابل ريال سعودي: السوقان (صنعاء ≈ 140، عدن ≈ 400+) — خارج 100..1500 غالبًا خطأ إدخال
+    const pair = [fromCur, toCur].sort().join('/');
+    if (pair === 'SAR/YER') { const yerPerSar = fromCur === 'YER' ? fromAmt / toAmt : toAmt / fromAmt; if (yerPerSar < 100 || yerPerSar > 1500) add('warn', 'fx-implausible', 'سعر صرف غير منطقي بين الريال اليمني والسعودي', `${where}: السعر الضمني ${+yerPerSar.toFixed(2)} ريال يمني لكل ريال سعودي — المعتاد بين 100 و1500. ربما أُدخل المبلغ بعملة خاطئة.`, null); return; }
+    if (fromCur === 'YER' || toCur === 'YER' || !rates) return; // اليمني له سوقان ولا يقارن بسعر واحد
+    const ref = convert(1, fromCur, toCur, rates); if (!ref) return;
+    const implied = toAmt / fromAmt, ratio = implied / ref;
+    if (ratio > 3 || ratio < 1 / 3) add('warn', 'fx-implausible', `سعر صرف بعيد جدًا عن السعر المرجعي (${fromCur}→${toCur})`, `${where}: الضمني ${+implied.toPrecision(4)} مقابل مرجعي ${+ref.toPrecision(4)} (أكثر من 3 أضعاف). راجع المبلغ والعملة.`, null);
+  }
   return f;
 }
 // تنفيذ إصلاح مقترح — يُستدعى فقط بضغطة من المستخدم، ويُسجل في التراجع

@@ -13,15 +13,16 @@ export function computeAlerts(data, { rates, now = today(), nowMs = Date.now(), 
   for (const pa of data.priceAlerts || []) {
     if (!pa.active) continue;
     let cur = null, label = '';
-    if (pa.asset === 'gold') { cur = gramPrice(data.market, pa.currency, rates, (pa.karat || 24) / 24); label = `الذهب عيار ${pa.karat || 24} للجرام`; }
+    if (pa.asset === 'gold') { if (!data.settings.goldOnline) continue; cur = gramPrice(data.market, pa.currency, rates, (pa.karat || 24) / 24); label = `الذهب عيار ${pa.karat || 24} للجرام`; }
     else { const sec = data.wealth?.securities?.find((s) => s.id === pa.securityId); const q = sec && quoteOf(data, sec); if (q && q.kind === 'market') cur = q.price; label = sec ? `${sec.symbol}` : 'سهم'; }
     if (cur === null) continue;
     const hit = pa.op === 'above' ? cur >= pa.value : cur <= pa.value;
     if (hit && on(pa.asset === 'gold' ? 'goldPrice' : 'stockPrice')) add(pa.asset === 'gold' ? 'goldPrice' : 'stockPrice', pa.id, 'mid', `${label} ${pa.op === 'above' ? 'تجاوز' : 'نزل تحت'} ${pa.value}`, `السعر الحالي ${+cur.toFixed(2)} ${pa.asset === 'gold' ? pa.currency : ''}`, pa.asset === 'gold' ? 'gold' : 'stocks');
   }
   if (on('staleMarket')) {
-    const g = data.market?.gold, has = data.wealth?.gold?.lots?.some((l) => l.remaining > 0);
-    if (has && (!g?.fetchedAt || nowMs - Date.parse(g.fetchedAt) > 2 * 864e5)) add('staleMarket', 'gold', 'low', 'سعر الذهب قديم أو غير متاح', g?.fetchedAt ? `آخر تحديث ${g.fetchedAt.slice(0, 10)}` : 'لم يُجلب سعر بعد', 'wealth');
+    // الذهب لا يُقيَّم تلقائيًا، فلا تنبيه «سعر ذهب قديم». ننبه فقط إن كان التقييم المعتمد أقدم من 90 يومًا.
+    const v = (data.wealth?.gold?.valuations || []).find((x) => x.approved);
+    if (v && nowMs - Date.parse(v.date) > 90 * 864e5) add('staleMarket', 'goldval', 'low', 'تقييم الذهب المعتمد قديم', `بتاريخ ${v.date} — حدّثه من «حاسبة الذهب» أو ألغِ اعتماده`, 'gold-calc');
     const old = Object.values(data.market?.quotes || {}).filter((q) => nowMs - Date.parse(q.fetchedAt) > 3 * 864e5).length;
     if (old) add('staleMarket', 'quotes', 'low', 'أسعار أسهم قديمة', `${old} ورقة لم يُحدَّث سعرها منذ أكثر من 3 أيام`, 'stocks');
   }

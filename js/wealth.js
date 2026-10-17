@@ -34,8 +34,16 @@ function inAccountCurrency(data, accountId, amount, currency, entered, label) {
 }
 
 // ======================= الذهب =======================
+// فلسفة 4.0: الذهب يُسجَّل ككمية مملوكة (جرام + عيار)، وليس كقيمة مالية تُحسب تلقائيًا.
+//  • لا يُقيَّم الذهب ولا يدخل صافي الثروة إلا بتقييم يحفظه المستخدم بنفسه من «حاسبة الذهب» ويعتمده صراحة.
+//  • سعر الشراء يبقى بعملته الأصلية دائمًا (2,000,000 ر.ي تبقى ر.ي مهما تغيرت عملة العرض).
+//  • العملة لا تُفترض أبدًا: يجب اختيارها صراحة عند وجود سعر شراء.
 export const GOLD_KINDS = { bar: 'سبيكة', lira: 'ليرة', coin: 'عملة ذهبية', jewelry: 'مشغولات', custom: 'نوع آخر' };
 export const KARATS = [24, 22, 21, 18];
+// حالات الحيازة: فقط owned و owned-elsewhere ملكية حاضرة
+export const OWNERSHIP = { owned: 'أملكه وهو عندي', 'owned-elsewhere': 'أملكه ومحفوظ عند شخص آخر', trust: 'أمانة عندي ولا أملكه', claim: 'مطالبة لي ولم أستلمه بعد' };
+export const isOwnedGold = (l) => !l.ownership || l.ownership === 'owned' || l.ownership === 'owned-elsewhere';
+export const GOLD_MARKETS = { SA: { label: 'السعودية', currency: 'SAR' }, 'YE-SANAA': { label: 'اليمن — صنعاء', currency: 'YER' }, 'YE-ADEN': { label: 'اليمن — عدن', currency: 'YER' }, custom: { label: 'سوق آخر', currency: '' } };
 export function purityOf(input) {
   if (input.karat === 'custom' || input.purity !== undefined && input.purity !== '' && !KARATS.includes(Number(input.karat))) {
     let p = parseAmount(input.purity);
@@ -50,25 +58,37 @@ export function purityOf(input) {
 }
 const karatLabel = (l) => (KARATS.includes(Number(l.karat)) ? `عيار ${l.karat}` : `نقاء ${+(l.purity * 1000).toFixed(1)}‰`);
 export { karatLabel };
+const karatKey = (l) => (KARATS.includes(Number(l.karat)) ? String(l.karat) : 'p' + Math.round(l.purity * 1000));
+export const goldKarats = (data) => [...new Set(W(data).gold.lots.filter((l) => l.remaining > 0).map(karatKey))];
+const ownText = (input) => (OWNERSHIP[input.ownership] ? input.ownership : 'owned');
+// العملة إلزامية متى وُجد مبلغ — لا نفترض عملة العرض
+function explicitCurrency(input, label = 'عملة الشراء') {
+  if (!isCurrency(input.currency)) fail(`اختر ${label} صراحة (مثل ر.ي أو ر.س) — لا يفترض فلوسي العملة`);
+  return input.currency;
+}
 
 export function addGoldLot(data, input) {
   const w = W(data);
-  const currency = isCurrency(input.currency) ? input.currency : data.settings.displayCurrency;
-  const grams = requireAmount(input.grams, 'QTY', 'الوزن بالجرام');
+  const grams = requireAmount(input.grams, 'QTY', 'الوزن الصافي للذهب بالجرام');
+  const gross = input.grossGrams === '' || input.grossGrams === undefined ? grams : requireAmount(input.grossGrams, 'QTY', 'الوزن الإجمالي');
+  if (gross + 1e-9 < grams) fail('الوزن الإجمالي لا يمكن أن يكون أقل من وزن الذهب الصافي');
+  const pieces = input.pieces === '' || input.pieces === undefined ? 1 : Math.round(requireAmount(input.pieces, 'QTY', 'عدد القطع'));
   const purity = purityOf(input);
   const acquisition = input.acquisition === 'owned' ? 'owned' : 'purchase';
   const costKnown = acquisition === 'purchase' || input.costKnown === true || input.costKnown === 'yes';
+  const currency = costKnown ? explicitCurrency(input) : (isCurrency(input.currency) ? input.currency : null);
   const cost = costKnown ? requireAmount(input.cost, currency, 'سعر الشراء') : 0;
   const making = costKnown ? optionalAmount(input.making, currency, 'المصنعية') : 0;
   const fees = costKnown ? optionalAmount(input.fees, currency, 'الرسوم') : 0;
-  const discount = optionalAmount(input.resaleDiscount, 'QTY', 'خصم إعادة البيع');
-  if (discount >= 100) fail('خصم إعادة البيع يجب أن يكون أقل من 100%');
+  const ownership = ownText(input);
+  if (acquisition === 'purchase' && input.accountId && ownership === 'trust') fail('ذهب الأمانة لا يُشترى من حساباتك — سجّله كأمانة دون حساب');
   const lot = { id: uid(), created: Date.now(), name: text(input.name, 90) || fail('اكتب اسم القطعة'), kind: GOLD_KINDS[input.kind] ? input.kind : 'jewelry',
     kindLabel: input.kind === 'custom' ? text(input.kindLabel, 40) : '', karat: KARATS.includes(Number(input.karat)) ? Number(input.karat) : 'custom', purity,
-    grams, remaining: grams, date: dateOr(input.date), acquisition, costKnown, cost, making, fees, currency,
-    costBasis: costKnown ? round(cost + making + fees, currency) : null, location: text(input.location, 90), seller: text(input.seller, 90), note: text(input.note, 300),
-    resaleDiscount: discount, attachments: [], accountId: null, txId: null };
+    grams, grossGrams: gross, pieces, remaining: grams, date: dateOr(input.date), acquisition, costKnown, cost, making, fees, currency,
+    costBasis: costKnown ? round(cost + making + fees, currency) : null, ownership, holder: text(input.holder, 90), location: text(input.location, 90),
+    seller: text(input.seller, 90), note: text(input.note, 300), moves: [], archived: false, attachments: [], accountId: null, txId: null };
   if (acquisition === 'purchase' && input.accountId) {
+    // شراء جديد ينفذ الآن: خصم واحد من الحساب. الذهب المملوك سابقًا لا يمس أي حساب أبدًا.
     const paid = inAccountCurrency(data, input.accountId, lot.costBasis, currency, input.paid, 'المبلغ المدفوع');
     const t = linkedTx(data, { accountId: input.accountId, type: 'expense', amount: paid, category: 'شراء ذهب', note: `${lot.name} — ${grams}غ ${karatLabel(lot)}`, date: lot.date,
       link: { kind: 'gold', id: lot.id }, orig: { amount: lot.costBasis, currency } });
@@ -79,43 +99,78 @@ export function addGoldLot(data, input) {
 }
 export function updateGoldLot(data, id, input) {
   const lot = W(data).gold.lots.find((x) => x.id === id) || fail('القطعة غير موجودة');
-  lot.name = text(input.name, 90) || fail('اكتب اسم القطعة');
-  if (GOLD_KINDS[input.kind]) { lot.kind = input.kind; lot.kindLabel = input.kind === 'custom' ? text(input.kindLabel, 40) : ''; }
-  for (const k of ['location', 'seller', 'note']) if (input[k] !== undefined) lot[k] = text(input[k], k === 'note' ? 300 : 90);
-  if (input.resaleDiscount !== undefined) { const d = optionalAmount(input.resaleDiscount, 'QTY', 'خصم إعادة البيع'); if (d >= 100) fail('الخصم يجب أن يكون أقل من 100%'); lot.resaleDiscount = d; }
   const sold = data.wealth.gold.sales.some((s) => s.lotId === id);
-  if (input.grams !== undefined && Number(parseAmount(input.grams)) !== lot.grams) {
-    if (sold) fail('لا يمكن تغيير الوزن بعد بيع جزء من القطعة — ألغِ البيع أولًا');
-    lot.grams = lot.remaining = requireAmount(input.grams, 'QTY', 'الوزن');
-  }
-  if (input.karat !== undefined || input.purity !== undefined) { if (sold) fail('لا يمكن تغيير العيار بعد البيع'); lot.purity = purityOf(input); lot.karat = KARATS.includes(Number(input.karat)) ? Number(input.karat) : 'custom'; }
-  if (lot.acquisition === 'owned' && input.cost !== undefined && !lot.txId) { // تكلفة معروفة لاحقًا لذهب مملوك سابقًا
+  const name = text(input.name, 90) || fail('اكتب اسم القطعة');
+  // تحقق كامل قبل أي تغيير
+  let grams = lot.grams, purity = lot.purity, karat = lot.karat;
+  if (input.grams !== undefined && Number(parseAmount(input.grams)) !== lot.grams) { if (sold) fail('لا يمكن تغيير الوزن بعد بيع جزء من القطعة — ألغِ البيع أولًا'); grams = requireAmount(input.grams, 'QTY', 'الوزن'); }
+  if ((input.karat !== undefined && String(input.karat) !== String(lot.karat)) || (input.karat === 'custom' && input.purity !== undefined && Number(parseAmount(input.purity)) !== lot.purity)) { if (sold) fail('لا يمكن تغيير العيار بعد البيع'); purity = purityOf(input); karat = KARATS.includes(Number(input.karat)) ? Number(input.karat) : 'custom'; }
+  const gross = input.grossGrams === undefined ? Math.max(lot.grossGrams || grams, grams) : input.grossGrams === '' ? grams : requireAmount(input.grossGrams, 'QTY', 'الوزن الإجمالي');
+  if (gross + 1e-9 < grams) fail('الوزن الإجمالي لا يمكن أن يكون أقل من وزن الذهب الصافي');
+  let cost = null;
+  if (lot.acquisition === 'owned' && !lot.txId && input.costKnown !== undefined) {
     const known = input.costKnown === true || input.costKnown === 'yes';
-    lot.costKnown = known; lot.cost = known ? requireAmount(input.cost, lot.currency, 'التكلفة') : 0;
-    lot.making = known ? optionalAmount(input.making, lot.currency, 'المصنعية') : 0; lot.fees = known ? optionalAmount(input.fees, lot.currency, 'الرسوم') : 0;
-    lot.costBasis = known ? round(lot.cost + lot.making + lot.fees, lot.currency) : null;
-    for (const s of data.wealth.gold.sales.filter((x) => x.lotId === id)) recalcSale(lot, s);
+    const cur = known ? explicitCurrency(input) : lot.currency;
+    cost = known ? { known, currency: cur, cost: requireAmount(input.cost, cur, 'التكلفة'), making: optionalAmount(input.making, cur, 'المصنعية'), fees: optionalAmount(input.fees, cur, 'الرسوم') } : { known: false, currency: cur, cost: 0, making: 0, fees: 0 };
   }
+  Object.assign(lot, { name, grams, purity, karat, grossGrams: gross });
+  if (!sold && input.grams !== undefined) lot.remaining = grams;
+  if (GOLD_KINDS[input.kind]) { lot.kind = input.kind; lot.kindLabel = input.kind === 'custom' ? text(input.kindLabel, 40) : ''; }
+  if (input.pieces !== undefined && input.pieces !== '') lot.pieces = Math.round(requireAmount(input.pieces, 'QTY', 'عدد القطع'));
+  if (OWNERSHIP[input.ownership]) lot.ownership = input.ownership;
+  for (const k of ['seller', 'note', 'holder']) if (input[k] !== undefined) lot[k] = text(input[k], k === 'note' ? 300 : 90);
+  if (cost) { Object.assign(lot, { costKnown: cost.known, currency: cost.currency, cost: cost.cost, making: cost.making, fees: cost.fees, costBasis: cost.known ? round(cost.cost + cost.making + cost.fees, cost.currency) : null }); for (const s of data.wealth.gold.sales.filter((x) => x.lotId === id)) recalcSale(lot, s); }
+  return touch(lot);
+}
+// تصحيح عملة سعر الشراء (إعادة تسمية دون تحويل) — لحالة إدخال 2,000,000 بعملة خاطئة. يُطلب صراحة ويُسجل.
+export function relabelGoldCurrency(data, id, currency) {
+  const lot = W(data).gold.lots.find((x) => x.id === id) || fail('القطعة غير موجودة');
+  if (!isCurrency(currency)) fail('اختر العملة الصحيحة');
+  if (lot.txId) fail('هذه القطعة مشتراة من حساب؛ عملة الشراء مرتبطة بحركة الحساب ولا تُغيَّر هنا');
+  if (lot.currency === currency) fail('العملة مطابقة أصلًا');
+  const from = lot.currency; lot.currency = currency;
+  for (const s of data.wealth.gold.sales.filter((x) => x.lotId === id)) { if (!s.txId) s.currency = currency; recalcSale(lot, s); }
+  (lot.fixes ||= []).push({ at: new Date().toISOString(), type: 'currency', from, to: currency });
+  return touch(lot);
+}
+// نقل الذهب بين أماكن الحفظ مع حفظ السجل
+export function moveGold(data, id, input) {
+  const lot = W(data).gold.lots.find((x) => x.id === id) || fail('القطعة غير موجودة');
+  const to = text(input.to, 90) || fail('اكتب المكان الجديد');
+  if (to === lot.location) fail('المكان الجديد مطابق للحالي');
+  (lot.moves ||= []).push({ id: uid(), date: dateOr(input.date), from: lot.location || '', to, note: text(input.note, 160) });
+  lot.location = to;
+  if (input.holder !== undefined) lot.holder = text(input.holder, 90);
+  return touch(lot);
+}
+export function setGoldArchived(data, id, archived) {
+  const lot = W(data).gold.lots.find((x) => x.id === id) || fail('القطعة غير موجودة');
+  if (archived && lot.remaining > 1e-9) fail('لا تُؤرشف إلا القطعة المباعة بالكامل');
+  lot.archived = !!archived;
   return touch(lot);
 }
 function recalcSale(lot, s) {
-  s.costPart = lot.costBasis === null ? null : round(lot.costBasis * (s.grams / lot.grams), lot.currency);
+  // الربح يُحسب فقط إذا كانت عملة البيع = عملة الشراء (لا تحويل ضمني بسعر اليوم)
+  s.costPart = lot.costBasis === null || s.currency !== lot.currency ? null : round(lot.costBasis * (s.grams / lot.grams), lot.currency);
   s.realized = s.costPart === null ? null : round(s.net - s.costPart, lot.currency);
 }
-// بيع كامل القطعة أو جزء منها. المتحصل بعملة القطعة؛ إن اختلفت عملة الحساب يُدخل المبلغ الفعلي المستلم.
+// بيع كامل القطعة أو جزء منها. المتحصل بعملته الصريحة؛ إن اختلفت عن عملة الحساب يُدخل المبلغ الفعلي المستلم.
 export function sellGold(data, lotId, input) {
   const w = W(data), lot = w.gold.lots.find((x) => x.id === lotId) || fail('القطعة غير موجودة');
+  if (!isOwnedGold(lot)) fail('لا يمكن بيع ذهب لا تملكه (أمانة أو مطالبة غير مستلمة)');
   const grams = requireAmount(input.grams, 'QTY', 'الوزن المباع');
   if (grams - lot.remaining > 1e-9) fail(`الوزن أكبر من المتبقي (${lot.remaining}غ)`);
-  const proceeds = requireAmount(input.proceeds, lot.currency, 'مبلغ البيع');
-  const fees = optionalAmount(input.fees, lot.currency, 'رسوم البيع');
+  const currency = isCurrency(input.currency) ? input.currency : lot.currency || fail('اختر عملة مبلغ البيع');
+  const proceeds = requireAmount(input.proceeds, currency, 'مبلغ البيع');
+  const fees = optionalAmount(input.fees, currency, 'رسوم البيع');
   if (fees - proceeds > 1e-9) fail('الرسوم أكبر من مبلغ البيع');
   const date = dateOr(input.date);
-  const s = { id: uid(), created: Date.now(), lotId, grams, proceeds, fees, net: round(proceeds - fees, lot.currency), currency: lot.currency, date, note: text(input.note, 200), accountId: null, txId: null };
+  const s = { id: uid(), created: Date.now(), lotId, grams, proceeds, fees, net: round(proceeds - fees, currency), currency, date, note: text(input.note, 200), accountId: null, txId: null };
   recalcSale(lot, s);
+  let got = 0;
+  if (input.accountId) got = inAccountCurrency(data, input.accountId, s.net, currency, input.received, 'المبلغ المستلم');
   if (input.accountId) {
-    const got = inAccountCurrency(data, input.accountId, s.net, lot.currency, input.received, 'المبلغ المستلم');
-    const t = linkedTx(data, { accountId: input.accountId, type: 'income', amount: got, category: 'بيع ذهب', note: `${lot.name} — ${grams}غ`, date, link: { kind: 'gold-sale', id: s.id }, orig: { amount: s.net, currency: lot.currency } });
+    const t = linkedTx(data, { accountId: input.accountId, type: 'income', amount: got, category: 'بيع ذهب', note: `${lot.name} — ${grams}غ`, date, link: { kind: 'gold-sale', id: s.id }, orig: { amount: s.net, currency } });
     s.accountId = t.accountId; s.txId = t.id;
   }
   lot.remaining = round(lot.remaining - grams, 'QTY');
@@ -127,7 +182,7 @@ export function sellGold(data, lotId, input) {
 export function cancelGoldSale(data, saleId) {
   const w = W(data), s = w.gold.sales.find((x) => x.id === saleId) || fail('عملية البيع غير موجودة');
   const lot = w.gold.lots.find((x) => x.id === s.lotId);
-  if (lot) lot.remaining = round(lot.remaining + s.grams, 'QTY');
+  if (lot) { lot.remaining = round(lot.remaining + s.grams, 'QTY'); lot.archived = false; }
   if (s.txId) data.transactions = data.transactions.filter((t) => t.id !== s.txId);
   w.gold.sales = w.gold.sales.filter((x) => x.id !== saleId);
 }
@@ -146,41 +201,79 @@ export function deleteGoldLot(data, id, opts = {}) {
   w.gold.lots = w.gold.lots.filter((l) => l.id !== id);
   w.gold.sales = w.gold.sales.filter((s) => s.lotId !== id);
 }
-// سعر الجرام للذهب الخالص بعملة معينة من سعر الأونصة بالدولار
+// سعر الجرام النظري من السعر العالمي (يُستخدم فقط عند طلب «اقتراح سعر من الإنترنت»)
 export function gramPrice(market, currency, rates, purity = 1) {
   const g = market?.gold;
   if (!(g?.usdPerOz > 0)) return null;
-  const usdPerGram = g.usdPerOz / OZ;
-  const v = convert(usdPerGram * purity, 'USD', currency, rates);
+  const v = convert((g.usdPerOz / OZ) * purity, 'USD', currency, rates);
   return v === null ? null : v;
 }
-export function goldSummary(data, market, rates, display = data.settings.displayCurrency) {
-  const w = W(data), lots = w.gold.lots;
-  const byKarat = {}; let pure = 0, grams = 0;
-  const T = () => makeTotaler(display, rates);
-  const value = T(), resale = T(), cost = T(), unknownValue = T(), realized = T(), unreal = T();
-  const priced = gramPrice(market, display, rates) !== null;
-  const items = lots.map((l) => {
-    const pureG = l.remaining * l.purity;
-    const mv = priced ? gramPrice(market, display, rates, l.purity) * l.remaining : null;           // قيمة الذهب الخالص بالسعر الفوري
-    const rv = mv === null ? null : mv * (1 - (l.resaleDiscount || 0) / 100);                         // بعد خصم إعادة البيع المتوقع (إن حُدد)
-    const remCost = l.costBasis === null ? null : l.costBasis * (l.remaining / l.grams);              // تكلفة الجزء المتبقي بعملة الشراء
-    const remCostDisp = remCost === null ? null : convert(remCost, l.currency, display, rates);
-    if (l.remaining > 0) {
-      grams += l.remaining; pure += pureG;
-      const key = karatLabel(l); byKarat[key] = round((byKarat[key] || 0) + l.remaining, 'QTY');
-      if (mv !== null) { value.add(mv, display); resale.add(rv, display); if (remCost === null) unknownValue.add(rv, display); }
-      if (remCost !== null) { cost.add(remCost, l.currency); if (rv !== null && remCostDisp !== null) unreal.add(rv - remCostDisp, display); }
-    }
-    return { lot: l, pureGrams: round(pureG, 'QTY'), marketValue: mv === null ? null : round(mv, display), resaleValue: rv === null ? null : round(rv, display),
-      remainingCost: remCostDisp === null ? null : round(remCostDisp, display), unrealized: rv !== null && remCostDisp !== null ? round(rv - remCostDisp, display) : null };
+// ---------- ملخص الكميات (بلا أي تقييم) ----------
+export function goldHoldings(data) {
+  const lots = W(data).gold.lots;
+  const sum = (arr) => arr.reduce((s, l) => s + l.remaining, 0);
+  const owned = lots.filter((l) => isOwnedGold(l) && l.remaining > 0), trust = lots.filter((l) => l.ownership === 'trust' && l.remaining > 0), claim = lots.filter((l) => l.ownership === 'claim' && l.remaining > 0);
+  const byKarat = {}, byLocation = {};
+  for (const l of owned) { const k = karatLabel(l); byKarat[k] = round((byKarat[k] || 0) + l.remaining, 'QTY'); const loc = l.location || 'غير محدد'; byLocation[loc] = round((byLocation[loc] || 0) + l.remaining, 'QTY'); }
+  const costs = {}; // تكلفة المتبقي بعملاتها الأصلية — لا جمع لعملات مختلفة
+  let unknownCost = 0;
+  for (const l of owned) { if (l.costBasis === null) { unknownCost++; continue; } costs[l.currency] = round((costs[l.currency] || 0) + l.costBasis * (l.remaining / l.grams), l.currency); }
+  const realizedByCur = {};
+  for (const s of W(data).gold.sales) if (s.realized !== null) realizedByCur[s.currency] = round((realizedByCur[s.currency] || 0) + s.realized, s.currency);
+  return { grams: round(sum(owned), 'QTY'), pureGrams: round(owned.reduce((s, l) => s + l.remaining * l.purity, 0), 'QTY'), pieces: owned.reduce((s, l) => s + (l.pieces || 1), 0), lots: owned.length,
+    byKarat, byLocation, costs, unknownCost, realizedByCur, trust: { grams: round(sum(trust), 'QTY'), lots: trust.length }, claim: { grams: round(sum(claim), 'QTY'), lots: claim.length } };
+}
+// ---------- حاسبة الذهب (لا تغيّر أي بيانات) ----------
+// prices: { '21': 350, '24': 400 } سعر الجرام بعملة واحدة. basis: 'karat' = السعر لنفس العيار، '24' = سعر جرام 24 ويُحسب المحتوى الخالص.
+export function goldCalc(items, { prices = {}, basis = 'karat', currency, fees = 0, discountPct = 0 } = {}) {
+  if (!isCurrency(currency)) fail('اختر عملة السعر');
+  const p24 = parseAmount(prices['24']);
+  const lines = items.map((it) => {
+    const key = KARATS.includes(Number(it.karat)) ? String(it.karat) : 'p' + Math.round(it.purity * 1000);
+    let ppg = null, how = '';
+    if (basis === '24') { if (p24 > 0) { ppg = p24 * it.purity; how = `سعر 24 × ${+(it.purity * 100).toFixed(2)}% (محتوى الذهب الخالص — تقدير نظري)`; } }
+    else { const p = parseAmount(prices[key]); if (p > 0) { ppg = p; how = 'سعر الجرام لنفس العيار'; } }
+    return { ...it, key, pricePerGram: ppg === null ? null : round(ppg, 'QTY'), value: ppg === null ? null : round(it.grams * ppg, currency), how };
   });
-  for (const s of w.gold.sales) if (s.realized !== null) realized.add(s.realized, s.currency);
-  const R = (t) => t.result();
-  const v = R(value), r = R(resale), c = R(cost), u = R(unknownValue), re = R(realized), un = R(unreal);
-  return { items, grams: round(grams, 'QTY'), pureGrams: round(pure, 'QTY'), byKarat, priced,
-    marketValue: priced ? v.total : null, resaleValue: priced ? r.total : null, costOfKnown: c.total, valueUnknownCost: u.total,
-    unrealized: priced ? un.total : null, realized: re.total, missing: [...new Set([...v.missing, ...c.missing, ...re.missing, ...un.missing])], display };
+  const priced = lines.filter((l) => l.value !== null), gross = priced.reduce((s, l) => s + l.value, 0);
+  const disc = optionalAmount(discountPct, 'QTY', 'نسبة الخصم'); if (disc >= 100) fail('الخصم يجب أن يكون أقل من 100%');
+  const fee = optionalAmount(fees, currency, 'الرسوم');
+  const net = round(Math.max(0, gross * (1 - disc / 100) - fee), currency);
+  return { currency, basis, lines, gross: round(gross, currency), discount: round(gross * disc / 100, currency), fees: fee, net, missing: lines.filter((l) => l.value === null).map((l) => l.key) };
+}
+export const lotItems = (lots) => lots.filter((l) => l.remaining > 0).map((l) => ({ lotId: l.id, name: l.name, grams: l.remaining, karat: l.karat, purity: l.purity }));
+// حفظ تقييم اختياري بتاريخ — لا يغيّر أي قطعة أو رصيد. approved=true فقط بطلب صريح ليظهر في ثروتي والزكاة.
+export function saveGoldValuation(data, input) {
+  const w = W(data); w.gold.valuations ||= [];
+  const currency = explicitCurrency(input, 'عملة السعر');
+  const prices = {};
+  for (const [k, v] of Object.entries(input.prices || {})) { const n = parseAmount(v); if (n > 0) prices[k] = round(n, 'QTY'); }
+  if (!Object.keys(prices).length) fail('أدخل سعر جرام واحد على الأقل');
+  const market = GOLD_MARKETS[input.market] ? input.market : 'custom';
+  const v = { id: uid(), created: Date.now(), date: dateOr(input.date), market, marketLabel: market === 'custom' ? text(input.marketLabel, 60) || 'سوق مخصص' : GOLD_MARKETS[market].label,
+    currency, basis: input.basis === '24' ? '24' : 'karat', side: input.side === 'buy' ? 'buy' : 'sell', prices, discountPct: optionalAmount(input.discountPct, 'QTY', 'الخصم'),
+    source: input.source === 'online' ? 'online' : 'manual', note: text(input.note, 160), approved: false };
+  if (input.approve) { for (const x of w.gold.valuations) x.approved = false; v.approved = true; }
+  w.gold.valuations.push(v);
+  return v;
+}
+export function setValuationApproved(data, id, approved) {
+  const w = W(data); const v = (w.gold.valuations || []).find((x) => x.id === id) || fail('التقييم غير موجود');
+  for (const x of w.gold.valuations) x.approved = false;
+  v.approved = !!approved;
+  return v;
+}
+export function deleteGoldValuation(data, id) { const w = W(data); w.gold.valuations = (w.gold.valuations || []).filter((x) => x.id !== id); }
+export const approvedValuation = (data) => (W(data).gold.valuations || []).find((v) => v.approved) || null;
+// قيمة الذهب المملوك حاليًا بأسعار التقييم المعتمد (إن وُجد) — وإلا null («غير مقيم»)
+export function goldSummary(data, rates, display = data.settings.displayCurrency) {
+  const h = goldHoldings(data), v = approvedValuation(data);
+  const owned = W(data).gold.lots.filter((l) => isOwnedGold(l) && l.remaining > 0);
+  if (!v || !owned.length) return { ...h, valued: false, valuation: v, value: null, valueDisplay: 0, missing: [] };
+  const c = goldCalc(lotItems(owned), { prices: v.prices, basis: v.basis, currency: v.currency, discountPct: v.discountPct });
+  const conv = convert(c.net, v.currency, display, rates);
+  return { ...h, valued: c.missing.length === 0, partial: c.missing.length > 0, valuation: v, value: c.net, valueCurrency: v.currency, calc: c,
+    valueDisplay: conv === null ? 0 : round(conv, display), missing: conv === null ? [v.currency] : [] };
 }
 
 // ======================= الأسهم والصناديق =======================
@@ -432,20 +525,22 @@ export function netWorth(data, rates, display = data.settings.displayCurrency) {
   for (const a of data.accounts) liq.add(balance(data, a), a.currency);
   for (const o of data.obligations) if (!o.archived) (o.type === 'debt' ? liab : recv).add(remainingOf(o), o.currency);
   for (const p of data.projects) if (!p.archived) recv.add(remainingOf(p), p.currency);
-  const gold = goldSummary(data, data.market, rates, display), sec = securitiesSummary(data, rates, display), inv = investmentsSummary(data, rates, display);
+  const gold = goldSummary(data, rates, display), sec = securitiesSummary(data, rates, display), inv = investmentsSummary(data, rates, display);
   const L = liq.result(), R = recv.result(), D = liab.result();
-  const parts = { liquidity: L.total, gold: gold.resaleValue ?? 0, stocks: sec.stocksValue, funds: round(sec.fundsValue + inv.fundsValue, display), other: inv.otherValue, receivables: R.total, liabilities: D.total };
+  const parts = { liquidity: L.total, gold: gold.valueDisplay, stocks: sec.stocksValue, funds: round(sec.fundsValue + inv.fundsValue, display), other: inv.otherValue, receivables: R.total, liabilities: D.total };
   const assets = parts.liquidity + parts.gold + parts.stocks + parts.funds + parts.other + parts.receivables;
   const notes = [];
-  if (W(data).gold.lots.some((l) => l.remaining > 0) && !gold.priced) notes.push('قيمة الذهب غير محسوبة: لا يوجد سعر ذهب محفوظ بعد.');
+  if (gold.grams > 0 && !gold.valuation) notes.push(`الذهب (${+gold.grams.toFixed(3)} غ) غير مقيَّم ولا يدخل في هذا الرقم — قيّمه بنفسك من «حاسبة الذهب» إن أردت.`);
+  else if (gold.grams > 0) notes.push(`الذهب محسوب بتقييمك المعتمد بتاريخ ${gold.valuation.date} (${gold.valuation.marketLabel}، ${gold.valuation.currency})${gold.partial ? ' — بعض العيارات بلا سعر في التقييم' : ''}.`);
   if (sec.unpriced.length) notes.push(`${sec.unpriced.length} ورقة مالية بلا سعر (غير محسوبة): ${sec.unpriced.map((s) => s.symbol).join('، ')}.`);
   if (inv.estimated) notes.push(`${inv.estimated} استثمار بلا تقييم — محسوب بقيمة رأس المال (تقديري).`);
   const missing = [...new Set([...L.missing, ...R.missing, ...D.missing, ...gold.missing, ...sec.missing, ...inv.missing])];
   if (missing.length) notes.push(`لا يوجد سعر صرف لـ ${missing.join('، ')} — المبالغ بها غير محسوبة.`);
   return { display, parts, assets: round(assets, display), net: round(assets - parts.liabilities, display),
-    realized: round(gold.realized + sec.realized + sec.dividends + inv.realized, display), unrealized: round((gold.priced ? gold.unrealized : 0) + sec.unrealized + inv.unrealized, display),
-    gold, securities: sec, investments: inv, notes, missing };
+    realized: round(sec.realized + sec.dividends + inv.realized + goldRealizedDisplay(gold, display, rates), display), unrealized: round(sec.unrealized + inv.unrealized, display),
+    partial: (gold.grams > 0 && !gold.valuation) || sec.unpriced.length > 0 || missing.length > 0, gold, securities: sec, investments: inv, notes, missing };
 }
+function goldRealizedDisplay(gold, display, rates) { const t = makeTotaler(display, rates); for (const [c, v] of Object.entries(gold.realizedByCur || {})) t.add(v, c); return t.result().total; }
 // لقطة يومية لصافي الثروة (واحدة لكل يوم، آخر 10 سنوات)
 export function recordNetWorth(data, nw, date = today()) {
   const h = (data.netWorthHistory ||= []);
@@ -468,11 +563,11 @@ export function performance(data, rates, display = data.settings.displayCurrency
     invested.add(r.buys, cur);
     for (const [m, k] of [[byBroker, broker], [byCurrency, cur], [byType, type]]) { if (r.value !== null) { add(m, k, 'value', r.value, cur); add(m, k, 'cost', r.cost, cur); } add(m, k, 'realized', r.realized + r.dividends, cur); }
   }
-  for (const l of w.gold.lots) if (l.costBasis !== null) invested.add(l.costBasis, l.currency);
+  for (const l of w.gold.lots) if (l.costBasis !== null && l.acquisition === 'purchase' && isOwnedGold(l)) invested.add(l.costBasis, l.currency);
   const g = nw.gold;
   (byType.gold ||= { value: T(), cost: T(), realized: T() });
-  if (g.priced) { byType.gold.value.add(g.resaleValue - g.valueUnknownCost, display); byType.gold.cost.add(g.costOfKnown, display); } // الذهب مجهول التكلفة لا يدخل في حساب الربح
-  byType.gold.realized.add(g.realized, display);
+  if (g.valuation) { byType.gold.value.add(g.valueDisplay, display); for (const [c, v] of Object.entries(g.costs)) byType.gold.cost.add(v, c); } // فقط عند وجود تقييم معتمد
+  for (const [c, v] of Object.entries(g.realizedByCur)) byType.gold.realized.add(v, c);
   for (const r of nw.investments.rows) {
     const t = FUNDS.includes(r.inv.kind) ? 'funds' : 'other';
     invested.add(r.contributed + r.fees, r.inv.currency);
@@ -499,16 +594,22 @@ export function investmentFlows(data, { from, to }, rates, display = data.settin
 
 // ======================= الزكاة (تقديرية) =======================
 export const ZAKAT_DEFAULTS = { hawlDate: '', nisabBasis: 'gold', goldNisabGrams: 85, silverNisabGrams: 595, rate: 2.5, jewelry: 'exclude', stocks: 'market', stocksRatio: 25,
-  funds: 'market', investments: 'value', receivables: 'strong', debts: 'due', silverUsdPerOz: null };
+  funds: 'market', investments: 'value', receivables: 'strong', debts: 'due', nisabPrice: null, goldPricing: 'valuation' };
+// الذهب في الزكاة: لا يُقيَّم تلقائيًا. المصدر إما التقييم المعتمد، أو أسعار يدخلها المستخدم في الحاسبة (manualGold)، وإلا يُعرض «غير مقيم».
+// النصاب: سعر جرام (ذهب 24 أو فضة) بعملة العرض يدخله المستخدم، أو سعر جرام 24 من التقييم المعتمد.
 export function zakatEstimate(data, opts = {}, rates, display = data.settings.displayCurrency) {
   const o = { ...ZAKAT_DEFAULTS, ...opts }, nw = netWorth(data, rates, display), lines = [];
   const L = (label, amount, included, note) => lines.push({ label, amount: round(amount, display), included: !!included && amount > 0, note });
   L('السيولة في الحسابات (الموجبة)', data.accounts.reduce((s, a) => { const b = balance(data, a); const c = convert(Math.max(0, b), a.currency, display, rates); return s + (c ?? 0); }, 0), true, 'النقد والأرصدة البنكية والمحافظ.');
-  const g = nw.gold, gp = gramPrice(data.market, display, rates);
-  for (const it of g.items) {
-    if (it.lot.remaining <= 0 || it.marketValue === null) continue;
-    const isJewel = it.lot.kind === 'jewelry';
-    L(`ذهب: ${it.lot.name}`, it.marketValue, !isJewel || o.jewelry === 'include', isJewel ? (o.jewelry === 'include' ? 'حُسبت مشغولات الاستعمال (حسب إعدادك).' : 'مشغولات للاستعمال الشخصي مستثناة حسب إعدادك — المسألة خلافية.') : 'سبائك وعملات: قيمة الذهب الخالص بالسعر الحالي.');
+  const owned = W(data).gold.lots.filter((l) => isOwnedGold(l) && l.remaining > 0);
+  const pricing = o.goldPricing === 'manual' && o.manualGold && isCurrency(o.manualGold.currency) ? o.manualGold : o.goldPricing === 'valuation' ? approvedValuation(data) : null;
+  const unvalued = [];
+  for (const l of owned) {
+    const isJewel = l.kind === 'jewelry';
+    const c = pricing ? goldCalc(lotItems([l]), { prices: pricing.prices, basis: pricing.basis, currency: pricing.currency }) : null;
+    const v = c && c.net > 0 ? convert(c.net, pricing.currency, display, rates) : null;
+    if (v === null) { unvalued.push(l); lines.push({ label: `ذهب: ${l.name} (${+l.remaining.toFixed(3)} غ ${karatLabel(l)})`, amount: 0, included: false, unvalued: true, note: 'غير مقيم — أدخل سعر الجرام لهذا العيار ليُحسب.' }); continue; }
+    L(`ذهب: ${l.name} (${+l.remaining.toFixed(3)} غ ${karatLabel(l)})`, v, !isJewel || o.jewelry === 'include', `${isJewel ? (o.jewelry === 'include' ? 'مشغولات محسوبة حسب إعدادك. ' : 'مشغولات للاستعمال الشخصي مستثناة حسب إعدادك — المسألة خلافية. ') : ''}بسعرك ${pricing === o.manualGold ? 'المدخل هنا' : `المعتمد بتاريخ ${pricing.date}`} (${pricing.currency}).`);
   }
   const sec = nw.securities;
   for (const r of sec.rows) {
@@ -531,19 +632,20 @@ export function zakatEstimate(data, opts = {}, rates, display = data.settings.di
     if (o.debts === 'all' || due) { const v = convert(remainingOf(ob), ob.currency, display, rates); if (v) deducted += v; }
   }
   base = Math.max(0, base - deducted);
-  const nisabGold = gp === null ? null : gp * o.goldNisabGrams;
-  const silverGram = o.silverUsdPerOz > 0 ? convert(o.silverUsdPerOz / OZ, 'USD', display, rates) : null;
-  const nisabSilver = silverGram === null ? null : silverGram * o.silverNisabGrams;
-  const nisab = o.nisabBasis === 'silver' ? nisabSilver : nisabGold;
+  let nisabPerGram = Number(o.nisabPrice) > 0 ? Number(o.nisabPrice) : null, nisabSource = nisabPerGram ? 'manual' : null;
+  if (!nisabPerGram && o.nisabBasis === 'gold' && pricing?.prices?.['24'] > 0) { nisabPerGram = convert(pricing.prices['24'], pricing.currency, display, rates); nisabSource = nisabPerGram ? 'valuation' : null; }
+  const nisab = nisabPerGram ? nisabPerGram * (o.nisabBasis === 'silver' ? o.silverNisabGrams : o.goldNisabGrams) : null;
   const hawlDone = !o.hawlDate || addDaysStr(o.hawlDate, 354) <= today();
   return { lines, deducted: round(deducted, display), base: round(base, display), nisab: nisab === null ? null : round(nisab, display), nisabBasis: o.nisabBasis,
     reached: nisab !== null && base >= nisab, hawlDone, hawlEnds: o.hawlDate ? addDaysStr(o.hawlDate, 354) : null,
-    due: nisab !== null && base >= nisab ? round(base * o.rate / 100, display) : 0, rate: o.rate, display, missing: nw.missing };
+    due: nisab !== null && base >= nisab ? round(base * o.rate / 100, display) : 0, rate: o.rate, display, missing: nw.missing, unvaluedGold: unvalued.length, nisabSource };
 }
 function addDaysStr(d, n) { const x = new Date(d + 'T12:00:00'); x.setDate(x.getDate() + n); return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`; }
 
 // ======================= سلامة بيانات الثروة =======================
-export function diagnoseWealth(data) {
+let rates0 = null;
+export function diagnoseWealth(data, rates) {
+  rates0 = rates || null;
   const w = W(data), f = [], tx = (id) => data.transactions.find((t) => t.id === id);
   const add = (severity, code, title, detail, fix) => f.push({ id: code + ':w' + f.length, severity, code, title, detail, fix });
   for (const l of w.gold.lots) {
@@ -562,9 +664,13 @@ export function diagnoseWealth(data) {
   // حركات مرتبطة بأصل لم يعد موجودًا
   const exists = { gold: (id) => w.gold.lots.some((l) => l.id === id), 'gold-sale': (id) => w.gold.sales.some((s) => s.id === id), trade: (id) => w.trades.some((t) => t.id === id), investment: (id) => w.investments.some((i) => i.id === id) };
   for (const t of data.transactions) if (t.link && exists[t.link.kind] && !exists[t.link.kind](t.link.id)) add('warn', 'asset-orphan', 'حركة مرتبطة بأصل محذوف', `${t.category} ${t.amount} ${t.currency} بتاريخ ${t.date}.`, { type: 'asset-unlink', txId: t.id, label: 'فصل الحركة (تبقى كما هي)', explain: 'تبقى الحركة ورصيدها؛ يُزال ربطها بأصل غير موجود.' });
-  // أسعار قديمة
-  const g = data.market?.gold;
-  if (w.gold.lots.some((l) => l.remaining > 0) && g?.fetchedAt && Date.now() - Date.parse(g.fetchedAt) > 3 * 864e5) add('info', 'gold-stale', 'سعر الذهب قديم', `آخر تحديث ${g.fetchedAt.slice(0, 10)} — قيمة الذهب قد لا تكون دقيقة.`, null);
+  // عملة شراء ذهب غير منطقية (مثل 2,000,000 مسجلة بالدولار أو الريال السعودي وهي بالريال اليمني)
+  for (const l of w.gold.lots) {
+    if (l.costBasis === null || !isCurrency(l.currency)) { if (l.costBasis !== null) add('error', 'gold-no-currency', `سعر شراء بلا عملة: ${l.name}`, 'حدد العملة الصحيحة من صفحة القطعة.', null); continue; }
+    const usd = rates0 && convert(l.costBasis / (l.grams * l.purity), l.currency, 'USD', rates0);
+    if (usd !== null && usd !== undefined && (usd > 1500 || usd < 2)) add('error', 'gold-currency-suspect', `عملة سعر الشراء قد تكون خاطئة: ${l.name}`, `التكلفة ${l.costBasis} ${l.currency} لـ ${l.grams} غ ${karatLabel(l)} تعني نحو ${Math.round(usd)}$ للجرام الخالص — رقم غير منطقي. ربما أُدخل المبلغ بعملة أخرى (مثل الريال اليمني). لم يُغيَّر شيء.`, { type: 'open-gold', lotId: l.id, label: 'مراجعة القطعة وتصحيح العملة', explain: 'تفتح صفحة القطعة؛ تصحيح العملة يغيّر رمز العملة فقط دون تحويل الرقم، وبعد تأكيدك.' });
+  }
+  for (const l of w.gold.lots) if (l.ownership === 'trust' && l.txId) add('warn', 'gold-trust-paid', `أمانة مرتبطة بحركة شراء: ${l.name}`, 'ذهب مسجل كأمانة لا تملكها لكنه مرتبط بخصم من حسابك.', null);
   return f;
 }
 export const FIXERS = {

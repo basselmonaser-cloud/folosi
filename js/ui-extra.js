@@ -80,8 +80,8 @@ export function register(ctx) {
 
   // ---------- سلامة البيانات ----------
   const SEV = { error: ['bad', 'خطر'], warn: ['warn', 'متوسط'], info: ['', 'منخفض'] };
-  const FIX_LABEL = { unlink: 'فصل الحركة عن السجل المحذوف', 'delete-tx': 'حذف هذه الحركة', 'drop-payment': 'حذف الدفعة التي بلا حركة', 'recalc-paid': 'تحديث القيمة المخزنة', reconcile: 'مطابقة مع البنك', 'review-initial': 'لم يحدث — احذف الحركة' };
-  const FIX_EXPLAIN = { unlink: 'تبقى الحركة ورصيدها كما هما؛ يُزال فقط ربطها بسجل لم يعد موجودًا.', 'delete-tx': 'تُحذف الحركة ويتغير رصيد حسابها.', 'drop-payment': 'تُحذف دفعة لا تقابلها أي حركة؛ يرتفع المتبقي ولا يتغير أي رصيد.', 'recalc-paid': 'تحديث رقم مخزن ليطابق مجموع الدفعات؛ لا يتغير أي رصيد.', reconcile: 'افتح مطابقة البنك وأدخل الرصيد الحقيقي.', 'review-initial': 'إن لم تستلم/تدفع هذا المبلغ فعلًا عند إنشاء الدين تُحذف الحركة.' };
+  const FIX_LABEL = { unlink: 'فصل الحركة عن السجل المحذوف', 'delete-tx': 'حذف هذه الحركة', 'drop-payment': 'حذف الدفعة التي بلا حركة', 'recalc-paid': 'تحديث القيمة المخزنة', reconcile: 'مطابقة مع البنك', 'review-initial': 'لم يحدث — احذف الحركة', 'open-gold': 'افتح القطعة لمراجعة العملة' };
+  const FIX_EXPLAIN = { unlink: 'تبقى الحركة ورصيدها كما هما؛ يُزال فقط ربطها بسجل لم يعد موجودًا.', 'delete-tx': 'تُحذف الحركة ويتغير رصيد حسابها.', 'drop-payment': 'تُحذف دفعة لا تقابلها أي حركة؛ يرتفع المتبقي ولا يتغير أي رصيد.', 'recalc-paid': 'تحديث رقم مخزن ليطابق مجموع الدفعات؛ لا يتغير أي رصيد.', reconcile: 'افتح مطابقة البنك وأدخل الرصيد الحقيقي.', 'review-initial': 'إن لم تستلم/تدفع هذا المبلغ فعلًا عند إنشاء الدين تُحذف الحركة.', 'open-gold': 'لا يتغير شيء تلقائيًا: افتح القطعة واستخدم «تصحيح عملة الشراء» إن كانت العملة خاطئة.' };
   const allFindings = () => [...C.diagnose(S.data, { rates: S.rates }), ...ctx.extraDiagnostics.flatMap((fn) => { try { return fn(S.data, S.rates) || []; } catch { return []; } })];
   S.integ ||= { sev: '' };
   function renderIntegrity() {
@@ -103,6 +103,7 @@ export function register(ctx) {
     const x = (S.findings || []).find((y) => y.id === fid); if (!x?.fix) return;
     let fix = x.fix;
     if (fix.type === 'reconcile') return openBankMatch(fix.accountId);
+    if (fix.type === 'open-gold') { const open = () => setTimeout(() => ctx.runAction('gold-open', fix.lotId), 0); if (S.view === 'gold') return open(); window.addEventListener('hashchange', open, { once: true }); return go('gold'); }
     if (fix.type === 'review-initial') fix = { type: 'delete-tx', txId: fix.txId };
     const apply = (d) => (ctx.fixers[fix.type] ? ctx.fixers[fix.type](d, fix) : C.applyFix(d, fix));
     // معاينة الأثر على نسخة من البيانات

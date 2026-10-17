@@ -5,7 +5,7 @@ const CACHE = 'folosi-app-' + VERSION;
 const ASSETS = [
   './', './index.html', './privacy.html', './manifest.webmanifest', './css/app.css',
   './js/app.js', './js/core.js', './js/store.js', './js/security.js', './js/fx.js', './js/drive.js', './js/config.js', './js/theme-boot.js',
-  './js/backup.js', './js/wealth.js', './js/prices.js', './js/alerts.js', './js/ui-extra.js', './js/ui-wealth.js', './js/ui-more.js',
+  './js/backup.js', './js/wealth.js', './js/prices.js', './js/alerts.js', './js/ui-extra.js', './js/ui-wealth.js', './js/ui-more.js', './js/ui-home.js',
   './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png',
   './fonts/ibm-plex-sans-arabic-arabic-400-normal.woff2', './fonts/ibm-plex-sans-arabic-arabic-500-normal.woff2', './fonts/ibm-plex-sans-arabic-arabic-700-normal.woff2',
   './fonts/ibm-plex-sans-arabic-latin-400-normal.woff2', './fonts/ibm-plex-sans-arabic-latin-500-normal.woff2', './fonts/ibm-plex-sans-arabic-latin-700-normal.woff2',
