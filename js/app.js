@@ -4,6 +4,11 @@ import * as Store from './store.js';
 import * as Sec from './security.js';
 import * as FX from './fx.js';
 import * as Drive from './drive.js';
+import * as B from './backup.js';
+import * as UIX from './ui-extra.js';
+import * as UIW from './ui-wealth.js';
+import * as Wm from './wealth.js';
+import * as UIM from './ui-more.js';
 import { BETA } from './config.js';
 
 const K = C.STORAGE_KEYS;
@@ -137,8 +142,12 @@ async function save(opts) {
 }
 // كل تعديل يمر من هنا: إن فشل التحقق تعود البيانات كما كانت تمامًا
 // كل عملية مالية تُسجل في سجل التراجع كوحدة واحدة (مع كل ما يرتبط بها). الإعدادات لا تُسجل.
-async function commit(fn, msg, { label, history = true } = {}) {
+async function commit(fn, msg, { label, history = true, snapshot: snapReason } = {}) {
   if (S.saveBlocked) throw new C.ValidationError('الحفظ موقوف حتى تنجح نسخة الأمان — راجع التنبيه أعلى الشاشة');
+  if (snapReason) { // عمليات خطرة: نسخة محلية متحقق منها قبل التنفيذ، وإلا لا يتغير شيء
+    const r = await Store.createSnapshot(S.data, S.session, snapReason).catch(() => ({ ok: false }));
+    if (!r.ok) throw new C.ValidationError('تعذر إنشاء نسخة احتياطية قبل هذه العملية — لم يتغير شيء');
+  }
   const snapshot = JSON.stringify(S.data);
   let result;
   try { result = fn(S.data); } catch (e) { S.data = JSON.parse(snapshot); throw e; }
@@ -146,7 +155,7 @@ async function commit(fn, msg, { label, history = true } = {}) {
   if (history) S.history = C.recordHistory(S.history, label || msg || 'تعديل', snapshot, S.data);
   render();
   const ok = await save();
-  if (ok) { scheduleDrive(); if (history) await Store.saveHistory(S.history, S.session); }
+  if (ok) { scheduleDrive(); if (history) { await Store.saveHistory(S.history, S.session); await recordAudit(label || msg || 'تعديل', snapshot); } }
   if (msg) ok ? toast(msg) : toast('تعذر الحفظ على هذا الجهاز!', true);
   return result;
 }
@@ -169,11 +178,26 @@ async function undoRedo(redo = false) {
     const lines = diff.map((x) => x.added ? `«${x.name}» سيعود (${plain(x.to, x.currency)})` : x.removed ? `«${x.name}» سيُزال` : `«${x.name}»: ${plain(x.from, x.currency)} ← ${plain(x.to, x.currency)}`);
     const ok = await confirmBox({ title: redo ? 'إعادة العملية؟' : 'التراجع عن آخر عملية؟', text: `${redo ? 'إعادة' : 'التراجع عن'}: «${r.label}». ${lines.length ? 'أثرها على الأرصدة: ' + lines.join('، ') + '.' : 'لا تغيّر أرصدة الحسابات.'} ستعود كل الحسابات والحركات والديون المرتبطة بها معًا.`, ok: redo ? 'إعادة' : 'تراجع' });
     if (!ok) return;
+    const beforeJSON = JSON.stringify(S.data);
     S.data = r.data; S.data.updatedAt = new Date().toISOString(); S.history = r.history;
     closeSheet(); render();
-    if (await save()) { scheduleDrive(); await Store.saveHistory(S.history, S.session); toast(redo ? `تمت الإعادة: ${r.label}` : `تم التراجع عن: ${r.label}`); }
+    if (await save()) {
+      scheduleDrive(); await Store.saveHistory(S.history, S.session);
+      try { const log = (await Store.loadAudit(S.session)) || { v: 1, entries: [] }; const m = C.markAudit(log, r.label, redo ? 'redone' : 'undone');
+        const e = C.auditEntry((redo ? 'إعادة: ' : 'تراجع عن: ') + r.label, JSON.parse(beforeJSON), S.data); e.meta = redo ? 'redo' : 'undo'; e.ref = m.ref;
+        await Store.saveAudit(C.appendAudit(m, e), S.session); } catch {}
+      toast(redo ? `تمت الإعادة: ${r.label}` : `تم التراجع عن: ${r.label}`);
+    }
     else toast('تعذر الحفظ على هذا الجهاز!', true);
   } finally { S.busyUndo = false; renderUndo(); }
+}
+// سجل التعديلات: يُحفظ مشفرًا مثل سجل التراجع، ويُقرأ عند الحاجة فقط
+async function recordAudit(label, beforeJSON, extra) {
+  try {
+    const log = (await Store.loadAudit(S.session)) || { v: 1, entries: [] };
+    const e = C.auditEntry(label, JSON.parse(beforeJSON), S.data); if (extra) Object.assign(e, extra);
+    await Store.saveAudit(C.appendAudit(log, e), S.session);
+  } catch (err) { console.warn('[folosi] audit', err?.name); }
 }
 async function resetHistory() { S.history = C.emptyHistory(); await Store.clearHistory(); renderUndo(); }
 function renderStatus() {
@@ -186,21 +210,23 @@ function renderStatus() {
 
 // ---------- التنقل ----------
 const VIEWS = ['home', 'history', 'accounts', 'clients', 'debts', 'goals', 'recurring', 'reports', 'more', 'settings', 'detail', 'converter'];
-const NAV_OF = { home: 'home', history: 'history', reports: 'reports', detail: 'home' };
+const EXT = { views: {}, actions: {}, nav: {} }; // وحدات الواجهة الإضافية (ui-extra.js، ui-wealth.js) تسجل شاشاتها وأزرارها هنا
+const NAV_OF = { home: 'home', history: 'history', detail: 'home' };
 function go(view, param = '') { location.hash = '#/' + view + (param ? '/' + param : ''); }
 function readHash() {
   const [, v = 'home', p = ''] = location.hash.split('/');
-  S.view = VIEWS.includes(v) ? v : 'home'; S.param = decodeURIComponent(p);
+  S.view = VIEWS.includes(v) || EXT.views[v] ? v : 'home'; S.param = decodeURIComponent(p);
 }
 window.addEventListener('hashchange', () => { readHash(); closeSheet(); render(); window.scrollTo(0, 0); });
 function render() {
   if (!S.data) return;
-  for (const v of VIEWS) $('v-' + v).classList.toggle('active', v === S.view);
-  const nav = NAV_OF[S.view] || 'more';
+  for (const v of [...VIEWS, ...Object.keys(EXT.views)]) $('v-' + v)?.classList.toggle('active', v === S.view);
+  const nav = NAV_OF[S.view] || EXT.nav[S.view] || 'more';
   document.querySelectorAll('[data-nav]').forEach((b) => (b.dataset.nav === nav ? b.setAttribute('aria-current', 'page') : b.removeAttribute('aria-current')));
+  if (EXT.views[S.view]) { EXT.views[S.view](); renderStatus(); renderBanners(); renderUndo(); CTX.afterRender?.(); return; }
   ({ home: renderHome, history: renderHistory, accounts: renderAccounts, clients: renderClients, debts: renderDebts, goals: renderGoals,
     recurring: renderRecurring, reports: renderReports, more: renderMore, settings: renderSettings, detail: renderDetail, converter: renderConverter })[S.view]();
-  renderStatus(); renderBanners(); renderUndo();
+  renderStatus(); renderBanners(); renderUndo(); CTX.afterRender?.();
 }
 const head = (title, back = 'more', extra = '') => `<div class="view-head"><button class="back" data-nav-to="${back}" aria-label="رجوع">${icon('i-back')}</button><h2>${esc(title)}</h2>${extra}</div>`;
 
@@ -253,6 +279,7 @@ function renderHome() {
       <small>${countLabel(d.accounts.filter((a) => !a.archived).length)}${curs.size > 1 ? ` · ${curs.size} عملات محوّلة إلى ${esc(curName(cur))} بالسعر الحالي` : ''} · اضغط للتفاصيل</small>
     </div>
     ${missingNote(tot.missing)}
+    ${(() => { const w = d.wealth, has = w && (w.gold.lots.length || w.trades.length || w.investments.length); if (!has) return ''; const n = Wm.netWorth(d, S.rates); return `<button class="card nw-card" data-nav-to="wealth"><small>صافي الثروة — ثروتي</small><div class="v">${money(n.net, cur)}</div><small>السيولة + الذهب + الاستثمارات + المستحقات − الديون</small></button>`; })()}
     <div class="stats">
       <button class="stat" data-nav-to="detail/income"><small>دخل الشهر</small><div class="v good">${money(sum.income, cur)}</div></button>
       <button class="stat" data-nav-to="detail/expense"><small>مصروف الشهر</small><div class="v bad">${money(sum.expense, cur)}</div></button>
@@ -414,7 +441,8 @@ function openTx(preset = {}, editId = null) {
 function openTxDetail(id) {
   const t = S.data.transactions.find((x) => x.id === id); if (!t) return;
   const a = acc(t.accountId), inc = t.type === 'income';
-  const linkInfo = t.link ? (t.link.kind === 'project' ? 'دفعة مرتبطة بمشروع عميل' : t.link.paymentId ? 'دفعة مرتبطة بدين' : 'حركة إنشاء دين/سلفة') : '';
+  const ASSET_LINK = { gold: 'شراء ذهب — من «ثروتي»', 'gold-sale': 'بيع ذهب — من «ثروتي»', trade: 'عملية أسهم — من «ثروتي»', investment: 'حركة استثمار — من «ثروتي»' };
+  const linkInfo = t.link ? (ASSET_LINK[t.link.kind] || (t.link.kind === 'project' ? 'دفعة مرتبطة بمشروع عميل' : t.link.paymentId ? 'دفعة مرتبطة بدين' : 'حركة إنشاء دين/سلفة')) : t.kind === 'adjustment' ? `تسوية رصيد${t.adjustment?.reason ? ' — ' + esc(t.adjustment.reason) : ''}` : '';
   sheet(inc ? 'دخل' : 'مصروف', `
     <div style="font-size:30px;font-weight:700;margin:8px 0" class="${inc ? 'good' : 'bad'}">${money(inc ? t.amount : -t.amount, t.currency, { sign: true })}</div>
     <ul class="list">
@@ -425,7 +453,8 @@ function openTxDetail(id) {
       ${t.note ? `<li class="item"><div class="body"><div class="sub">ملاحظة</div><div class="title">${esc(t.note)}</div></div></li>` : ''}
       ${linkInfo ? `<li class="item"><div class="body"><div class="sub">ارتباط</div><div class="title">${linkInfo}${t.excludeFromReports ? ' · لا تُحتسب دخلًا أو مصروفًا' : ''}</div></div></li>` : ''}
     </ul>
-    <div class="actions">${t.link ? '' : `<button class="btn primary" data-action="edit-tx" data-id="${esc(t.id)}">تعديل</button>`}<button class="btn ghost-danger" data-action="del-tx" data-id="${esc(t.id)}">حذف</button></div>`);
+    ${CTX.attachList ? CTX.attachList('tx', t.id) : ''}
+    <div class="actions">${t.link ? '' : `<button class="btn primary" data-action="edit-tx" data-id="${esc(t.id)}">تعديل</button>`}${t.link && ASSET_LINK[t.link.kind] ? '' : `<button class="btn ghost-danger" data-action="del-tx" data-id="${esc(t.id)}">حذف</button>`}</div>`);
 }
 async function deleteTx(id) {
   const t = S.data.transactions.find((x) => x.id === id); if (!t) return;
@@ -457,8 +486,10 @@ function openAccount(id) {
     ${a ? `<div class="kpis"><div><small>الرصيد الحالي</small><b>${money(C.balance(S.data, a), a.currency)}</b></div><div><small>الحركات</small><b>${usage.transactions + usage.transfers}</b></div></div>` : ''}
     <label for="aOpen">${a ? 'الرصيد الافتتاحي' : 'الرصيد الحالي'}</label><input id="aOpen" name="opening" inputmode="decimal" value="${esc(a ? a.opening : '0')}">
     <div class="hint" id="aOpenHint">${a ? `الافتتاحي = رصيد الحساب <b>قبل</b> أول عملية مسجلة هنا، وليس رصيدك اليوم. لمطابقة رصيدك مع كشف البنك استخدم «تسوية مع الكشف».` : 'اكتب الرصيد الموجود فعليًا في الحساب الآن. للسالب اكتب علامة - قبل الرقم.'}${inUse ? ' لا يمكن تغيير عملة حساب عليه عمليات.' : ''}</div>
-    ${a ? `<div class="actions"><button type="button" class="btn small" data-action="reconcile" data-id="${esc(a.id)}">تسوية مع كشف البنك</button><button type="button" class="btn small" data-action="account-history" data-id="${esc(a.id)}">كشف الحساب</button></div>
-      <div class="actions"><button type="button" class="btn small" data-action="archive-account" data-id="${esc(a.id)}">${a.archived ? 'إعادة فتح الحساب' : 'إغلاق/أرشفة الحساب'}</button><button type="button" class="btn small ghost-danger" data-action="del-account" data-id="${esc(a.id)}">حذف الحساب…</button></div>` : ''}`, {
+    ${a ? `<div class="actions"><button type="button" class="btn small" data-action="reconcile" data-id="${esc(a.id)}">تسوية مع كشف البنك</button><button type="button" class="btn small" data-action="statement" data-id="${esc(a.id)}">كشف الحساب</button></div>
+      <div class="actions"><button type="button" class="btn small" data-action="archive-account" data-id="${esc(a.id)}">${a.archived ? 'إعادة فتح الحساب' : 'إغلاق/أرشفة الحساب'}</button><button type="button" class="btn small ghost-danger" data-action="del-account" data-id="${esc(a.id)}">حذف الحساب…</button></div>
+      <label for="aLow">نبّهني إذا انخفض الرصيد عن (اختياري)</label><input id="aLow" name="lowBalance" inputmode="decimal" value="${esc(a.lowBalance ?? '')}">
+      ${CTX.attachList ? CTX.attachList('account', a.id) : ''}` : ''}`, {
     submit: a ? 'حفظ' : 'إضافة الحساب',
     onReady: (body, form) => {
       body.querySelectorAll('[data-preset]').forEach((b) => (b.onclick = () => { form.elements.name.value = b.dataset.preset; form.elements.type.value = b.dataset.ptype; form.dataset.typeTouched = '1'; }));
@@ -479,27 +510,10 @@ function openAccount(id) {
         if (pv && pv.delta !== 0 && !(await confirmBox({ title: 'تعديل الرصيد الافتتاحي؟', text: `رصيد «${a.name}» سيتغير من ${plain(pv.current, a.currency)} إلى ${plain(pv.next, a.currency)} (فرق ${plain(pv.delta, a.currency)}). إن كنت تريد مطابقة الرصيد مع كشف البنك فالأفضل «تسوية مع كشف البنك». يمكنك التراجع لاحقًا.`, ok: 'حفظ التعديل' }))) return false;
         return commit((d) => C.updateAccount(d, a.id, { ...v, currency: inUse ? undefined : v.currency }), 'تم حفظ الحساب', { label: pv ? `تعديل الرصيد الافتتاحي لـ«${a.name}»` : `تعديل الحساب «${a.name}»` });
       }
+      const same = S.data.accounts.filter((x) => x.name === String(v.name || '').trim());
+      if (same.length && !(await confirmBox({ title: 'يوجد حساب بنفس الاسم', text: `لديك ${same.length === 1 ? 'حساب' : same.length + ' حسابات'} باسم «${v.name}»${same.some((x) => x.archived) ? ' (منها مؤرشف)' : ''}. يمكن إنشاء حساب آخر بنفس الاسم — كل حساب منفصل تمامًا بمعرّفه — لكن قد يسبب الالتباس عند الاختيار. يُفضل إضافة تمييز مثل «الراجحي - الراتب».`, ok: 'إنشاء على أي حال', cancel: 'تعديل الاسم' }))) return false;
       return commit((d) => C.addAccount(d, v), 'تمت إضافة الحساب', { label: `إضافة الحساب «${v.name}»` });
     },
-  });
-}
-// تسوية الرصيد مع كشف البنك عبر حركة تسوية واضحة (لا تُحتسب دخلًا ولا مصروفًا)
-function openReconcile(id) {
-  const a = acc(id); if (!a) return;
-  const cur = C.balance(S.data, a);
-  sheet(`تسوية «${a.name}» مع الكشف`, `
-    <p class="muted">الرصيد في فلوسي: ${money(cur, a.currency)}</p>
-    <label for="rcS">الرصيد الفعلي في كشف البنك/المحفظة (${esc(a.currency)})</label><input id="rcS" name="statement" class="amount-input" inputmode="decimal" required placeholder="0">
-    <div class="hint" id="rcH">ستُضاف حركة «تسوية رصيد» بالفرق فقط، ولا تُحتسب دخلًا أو مصروفًا في التقارير. لا يتغير الافتتاحي ولا أي حركة سابقة.</div>
-    <div class="grid2"><div><label>التاريخ</label><input type="date" name="date" value="${C.today()}"></div><div><label>ملاحظة</label><input name="note" maxlength="200" placeholder="كشف ${esc(C.today())}"></div></div>`, {
-    submit: 'تسجيل التسوية',
-    onChange: (form) => {
-      const raw = form.elements.statement.value.trim(); if (!raw) return;
-      const neg = raw.startsWith('-'), n = C.parseAmount(raw.replace(/^-/, '')); if (Number.isNaN(n)) return;
-      const diff = C.round((neg ? -n : n) - cur, a.currency);
-      $('rcH').innerHTML = diff === 0 ? 'الرصيد مطابق — لا حاجة لتسوية.' : `سيُسجل فرق ${money(diff, a.currency, { sign: true })} كحركة «تسوية رصيد»، ويصبح الرصيد ${money(neg ? -n : n, a.currency)}.`;
-    },
-    onSubmit: (v) => commit((d) => C.reconcileAccount(d, a.id, v), 'تمت التسوية', { label: `تسوية «${a.name}» مع الكشف` }),
   });
 }
 // حذف حساب: بلا حركات = حذف مباشر. عليه حركات = أرشفة (موصى به) أو نقل كل حركاته إلى حساب آخر بنفس العملة.
@@ -526,7 +540,7 @@ async function deleteAccountFlow(id) {
   f.onsubmit = async (e) => {
     e.preventDefault(); const t = acc(f.elements.target.value);
     if (!(await confirmBox({ title: 'نقل الحركات وحذف الحساب؟', text: `ستنتقل كل حركات «${a.name}» إلى «${t.name}» ويُحذف «${a.name}». يمكنك التراجع بعدها.`, ok: 'نقل وحذف', danger: true }))) return;
-    try { await commit((d) => C.deleteAccount(d, id, { mode: 'merge', targetId: t.id }), 'تم النقل والحذف', { label: `دمج «${a.name}» في «${t.name}»` }); closeSheet(); } catch (err) { toast(errText(err), true); }
+    try { await commit((d) => C.deleteAccount(d, id, { mode: 'merge', targetId: t.id }), 'تم النقل والحذف', { label: `دمج «${a.name}» في «${t.name}»`, snapshot: 'pre-merge' }); closeSheet(); } catch (err) { toast(errText(err), true); }
   };
 }
 function openTransfer() {
@@ -687,7 +701,7 @@ async function deleteItemFlow(kind, id) {
   $('delKeep').onclick = async () => { await commit((d) => C.deleteItem(d, kind, id, { mode: 'keep' }), 'تم حذف السجل وبقيت الحركات', { label: `حذف «${name}» (مع إبقاء الحركات)` }); closeSheet(); };
   $('delRev').onclick = async () => {
     if (!(await confirmBox({ title: 'عكس أثر الدفعات؟', text: 'ستُحذف الحركات المرتبطة وتعود الأرصدة كما كانت قبلها، وتختفي من التقارير. هل هذه الدفعات لم تحدث فعلًا؟', ok: 'حذف وعكس', danger: true }))) return;
-    await commit((d) => C.deleteItem(d, kind, id, { mode: 'reverse' }), 'تم الحذف وعكس الحركات', { label: `حذف «${name}» مع حركاته` }); closeSheet();
+    await commit((d) => C.deleteItem(d, kind, id, { mode: 'reverse' }), 'تم الحذف وعكس الحركات', { label: `حذف «${name}» مع حركاته`, snapshot: 'pre-fix' }); closeSheet();
   };
 }
 
@@ -704,6 +718,7 @@ function renderDebts() {
   $('v-debts').innerHTML = `${head('الديون')}
     <div class="seg" style="margin:8px 0"><button data-debt-tab="receivable" aria-pressed="${tab === 'receivable'}">ديون لي</button><button data-debt-tab="debt" aria-pressed="${tab === 'debt'}">ديون عليّ</button></div>
     <div class="card"><small>المتبقي ${tab === 'debt' ? 'عليّ' : 'لي'}</small><div style="font-size:26px;font-weight:700">${money(t.total, disp())}</div>${missingNote(t.missing)}</div>
+    ${(() => { const r = C.dueReminders(S.data).filter((x) => x.kind === 'obligation' && x.type === tab); return r.length ? `<div class="notice">${r.map((x) => `<div><b>${esc(x.party)}</b>: ${x.overdue ? `متأخر ${-x.days} يوم` : x.days === 0 ? 'يستحق اليوم' : `يستحق بعد ${x.days} يوم`} — المتبقي ${plain(x.remaining, x.currency)}</div>`).join('')}</div>` : ''; })()}
     <button class="btn primary block" data-action="add-ob" data-type="${tab}">${tab === 'debt' ? 'إضافة دين عليّ' : 'إضافة دين لي'}</button>
     <div class="seg" style="margin:12px 0 0">${['active', 'settled', 'archived'].map((k) => `<button data-debt-status="${k}" aria-pressed="${st === k}">${C.STATUS_LABELS[k]} (${cnt(k)})</button>`).join('')}</div>
     <div class="card">${list.length ? `<ul class="list">${list.map(obRow).join('')}</ul>` : `<div class="empty">${st === 'active' ? 'لا توجد ديون نشطة' : st === 'settled' ? 'لا توجد ديون مسددة غير مؤرشفة' : 'لا يوجد أرشيف'}</div>`}</div>`;
@@ -715,6 +730,7 @@ function openObForm(type = 'receivable', id) {
     <label for="op">اسم الشخص أو الجهة</label><input id="op" name="party" required maxlength="100" value="${esc(o?.party || '')}">
     <div class="grid2" style="grid-template-columns:2fr 1fr"><div><label for="oa">المبلغ الكامل</label><input id="oa" name="amount" inputmode="decimal" required value="${esc(o?.amount || '')}"></div><div><label>العملة</label><select name="currency" ${o ? 'disabled' : ''}>${currencyOptions(o?.currency || disp())}</select></div></div>
     <div class="grid2"><div><label>رقم التواصل</label><input name="phone" type="tel" dir="ltr" maxlength="35" value="${esc(o?.phone || '')}"></div><div><label>تاريخ الاستحقاق</label><input type="date" name="due" value="${esc(o?.due || '')}"></div></div>
+    <label for="oRem">التذكير قبل الاستحقاق بـ (أيام)</label><input id="oRem" name="remindDays" inputmode="numeric" value="${esc(o?.remindDays ?? 3)}">
     ${o ? `<p class="hint">أصل الدين: ${esc(C.DEBT_ORIGINS[o.type][o.origin] || 'من إصدار سابق')}. لا يمكن تغييره بعد الإنشاء لأنه يحدد أثر الدفعات المسجلة.</p>`
       : `<label>ما أصل هذا الدين؟</label><input type="hidden" name="origin" value=""><div class="origin-list" id="omOrig"></div>
       <div class="hint" id="omH">اختر أحد الخيارات — يحدد هل يتغير رصيد حساباتك الآن، وهل يُحتسب السداد مصروفًا/دخلًا.</div>
@@ -753,7 +769,7 @@ function openOb(id) {
     <p class="muted">${o.phone ? `<span dir="ltr">${esc(o.phone)}</span> · ` : ''}${o.due ? 'الاستحقاق ' + esc(o.due) + ' ' + dueTag(o.due, rem) : 'بدون موعد'}${o.note ? '<br>' + esc(o.note) : ''}</p>
     ${o.archived ? '<div class="notice info">هذا الدين مؤرشف: دفعاته وحركاته محفوظة كما هي ولا يمكن تعديلها حتى تلغي الأرشفة.</div>' : ''}
     <div class="actions">${rem > 0 && !o.archived ? `<button class="btn primary" data-action="pay" data-kind="obligation" data-id="${esc(o.id)}">${o.type === 'debt' ? 'تسجيل سداد' : 'تسجيل تحصيل'}</button>` : ''}${phoneLinks(o.phone)}${o.archived ? '' : `<button class="btn" data-action="edit-ob" data-id="${esc(o.id)}">تعديل</button>`}</div>
-    <h3 style="margin-top:16px">الدفعات</h3>${paymentsList(o, 'obligation')}
+    <h3 style="margin-top:16px">الدفعات</h3>${paymentsList(o, 'obligation')}${CTX.attachList ? CTX.attachList('obligation', o.id) : ''}
     <div class="actions">${st !== 'active' ? `<button class="btn small" data-action="archive-item" data-kind="obligation" data-id="${esc(o.id)}">${o.archived ? 'إلغاء الأرشفة' : 'أرشفة'}</button>` : ''}<button class="btn small ghost-danger" data-action="del-item" data-kind="obligation" data-id="${esc(o.id)}">حذف…</button></div>`);
 }
 
@@ -851,6 +867,7 @@ function renderReports() {
     <div class="card"><div class="kpis"><div><small>الدخل</small><b class="good">${money(s.income, cur)}</b></div><div><small>المصروف</small><b class="bad">${money(s.expense, cur)}</b></div><div><small>الصافي</small><b class="${s.net >= 0 ? 'good' : 'bad'}">${money(s.net, cur)}</b></div></div>
       ${r.mode === 'year' ? `<div style="margin-top:14px">${barChart(C.yearSeries(d, r.year, S.rates), cur)}</div>` : ''}
       ${missingNote(s.missing)}${multi ? `<p class="hint">المبالغ بعملات أخرى محوّلة إلى ${esc(curName(cur))} بسعر الصرف الحالي (وليس سعر تاريخ العملية). ${S.rates.fetchedAt ? `آخر تحديث للأسعار: ${esc(dt(S.rates.fetchedAt))}` : ''}</p>` : ''}</div>
+    ${(CTX.reportCards || []).map((f) => { try { return f(range); } catch { return ''; } }).join('')}
     <div class="card"><h3>المصروف حسب التصنيف</h3>${catBars(s.byCategory.expense, cur, '')}</div>
     <div class="card"><h3>الدخل حسب التصنيف</h3>${catBars(s.byCategory.income, cur, 'good')}</div>
     <div class="card"><h3>السيولة المتوقعة خلال 30 يومًا</h3>
@@ -937,7 +954,9 @@ function openYerMarkets(focus) {
 
 // ---------- المزيد ----------
 function renderMore() {
-  const items = [['accounts', 'i-wallet', 'الحسابات'], ['clients', 'i-users', 'العملاء والمشاريع'], ['debts', 'i-hand', 'الديون'], ['goals', 'i-target', 'الادخار'], ['recurring', 'i-bill', 'الفواتير المتكررة'], ['history', 'i-list', 'سجل العمليات'], ['reports', 'i-chart', 'التقارير'], ['converter', 'i-swap', 'محول العملات'], ['settings', 'i-gear', 'الإعدادات']];
+  const items = [['reports', 'i-chart', 'التقارير'], ['accounts', 'i-wallet', 'الحسابات'], ['debts', 'i-hand', 'الديون'], ['wealth', 'i-gold', 'ثروتي'], ['gold', 'i-gold', 'الذهب'], ['stocks', 'i-chart', 'الأسهم والصناديق'],
+    ['clients', 'i-users', 'العملاء والمشاريع'], ['goals', 'i-target', 'الأهداف'], ['recurring', 'i-bill', 'المجدولة والمتكررة'], ['history', 'i-list', 'سجل العمليات'], ['zakat', 'i-hand', 'الزكاة'], ['converter', 'i-swap', 'محول العملات'],
+    ['integrity', 'i-lock', 'سلامة البيانات'], ['audit', 'i-list', 'سجل التعديلات'], ['settings', 'i-gear', 'الإعدادات']];
   $('v-more').innerHTML = `<div class="view-head"><h2>المزيد</h2></div><div class="more-grid">${items.map(([v, i, l]) => `<button class="shortcut" data-nav-to="${v}"><span class="ico">${icon(i)}</span><span>${l}</span></button>`).join('')}
     <button class="shortcut" data-action="transfer"><span class="ico">${icon('i-swap')}</span><span>تحويل بين الحسابات</span></button></div>`;
 }
@@ -975,13 +994,13 @@ function renderSettings() {
       : `<p class="muted">القفل غير مفعّل. عند التفعيل تُشفَّر بياناتك على الجهاز ولا تُفتح إلا برمزك${S.passkeyOK ? ' أو بـ Face ID' : ''}.</p><button class="btn primary" data-action="lock-on">تفعيل القفل والتشفير</button>`}
       <details style="margin-top:10px"><summary class="muted" style="font-size:14px">ما الفرق بين القفل والتشفير؟</summary><p class="muted" style="font-size:14px;line-height:1.8">شاشة القفل وحدها (التحقق من هويتك) تمنع من يمسك جوالك المفتوح من رؤية الأرقام، لكنها لا تحمي الملفات نفسها. التشفير يحوّل البيانات المحفوظة إلى نص غير مقروء بدون المفتاح. في فلوسي يُشتق المفتاح من رمزك عبر PBKDF2 (600 ألف تكرار) أو من Face ID عبر مفتاح مرور (Passkey/PRF)، ولا يُحفظ الرمز نفسه.<br>• الرمز من 6 أرقام يحمي من المتطفل العادي، لكن من ينسخ ملفات المتصفح بأدوات متخصصة قد يجربه حاسوبيًا؛ كلمة مرور طويلة أقوى بكثير.<br>• نسيت الرمز؟ استخدم مفتاح الاسترداد. بدونه ودون نسخة احتياطية لا يمكن استعادة البيانات — لا أحد يملك مفتاحًا خلفيًا.</p></details></div>
 
-    <div class="card"><h3>فحص سلامة الأرصدة</h3><p class="muted" style="font-size:14px">يفحص الحسابات والديون والدفعات بحثًا عن أخطاء قد تجعل الرصيد غير صحيح (سداد مكرر، حركات يتيمة، أرصدة سالبة…). الفحص للقراءة فقط ولا يغيّر شيئًا؛ أي إصلاح يتم بضغطة منك ويمكن التراجع عنه.</p>
-      <div class="actions"><button class="btn small primary" data-action="diagnostics">تشغيل الفحص</button>${S.hasUpgradeBackup ? '<button class="btn small" data-action="restore-upgrade-backup">استعادة نسخة ما قبل 3.1</button>' : ''}</div></div>
+    <div class="card"><h3>سلامة البيانات وسجل التعديلات</h3><p class="muted" style="font-size:14px">يفحص الحسابات والديون والدفعات بحثًا عن أخطاء قد تجعل الرصيد غير صحيح (سداد مكرر، حركات يتيمة، أرصدة سالبة…). الفحص للقراءة فقط ولا يغيّر شيئًا؛ أي إصلاح يتم بضغطة منك ويمكن التراجع عنه.</p>
+      <div class="actions"><button class="btn small primary" data-action="diagnostics">سلامة البيانات</button><button class="btn small" data-action="audit">سجل التعديلات</button></div></div>
 
     <div class="card"><h3>النسخ الاحتياطي</h3>
       <p class="muted" style="font-size:14px">بياناتك محفوظة تلقائيًا على هذا الجهاز، لكن التخزين المحلي وحده لا يضمن عدم الفقد (ضياع الجوال، حذف التطبيق، مسح بيانات Safari). احتفظ بنسخة خارجية.</p>
       <div class="actions"><button class="btn primary small" data-action="export-enc">نسخة مشفرة (موصى به)</button><button class="btn small" data-action="export-json">نسخة JSON غير مشفرة</button><button class="btn small" data-action="export-csv">تصدير CSV</button></div>
-      <div class="actions"><label class="btn small" for="importFile" style="margin:0;color:var(--ink)">استعادة من ملف…</label></div><input id="importFile" type="file" accept=".json,application/json" class="sr-only">
+      <div class="actions"><button class="btn small" data-action="backups">النسخ على الجهاز</button><label class="btn small" for="importFile" style="margin:0;color:var(--ink)">استعادة من ملف…</label></div><input id="importFile" type="file" accept=".json,application/json" class="sr-only">
       ${S.hasPreRestore ? '<div class="actions"><button class="btn small" data-action="undo-restore">التراجع عن آخر استعادة</button></div>' : ''}
       <p class="hint">${Store.lsGet('folosi_last_export') ? 'آخر نسخة ملف: ' + esc(dt(Store.lsGet('folosi_last_export'))) : 'لم تُنزّل نسخة ملف بعد.'}</p></div>
 
@@ -1071,8 +1090,10 @@ function download(name, body, type) {
   a.href = url; a.download = name; document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 const exportedNow = () => { Store.lsSet('folosi_last_export', new Date().toISOString()); };
-function exportPlain() {
-  download(`folosi-${C.today()}.json`, JSON.stringify({ ...S.data, exportedAt: new Date().toISOString(), app: 'folosi', appVersion: C.APP_VERSION }, null, 1), 'application/json'); exportedNow();
+async function exportPlain() {
+  const clean = JSON.parse(JSON.stringify(S.data)); delete clean.settings.twelveDataKey; // لا مفاتيح في ملف غير مشفر
+  const integrity = await B.sha256(JSON.stringify(clean)); // بصمة تُفحص عند الاستعادة لاكتشاف أي تلف أو تعديل
+  download(`folosi-${C.today()}.json`, JSON.stringify({ ...clean, exportedAt: new Date().toISOString(), app: 'folosi', appVersion: C.APP_VERSION, integrity }), 'application/json'); exportedNow();
 }
 function askBackupPassword({ title = 'كلمة مرور النسخة', confirm2 = true, hint = '' }) {
   return new Promise((resolve) => {
@@ -1088,8 +1109,23 @@ function askBackupPassword({ title = 'كلمة مرور النسخة', confirm2 
 async function exportEncrypted() {
   const p = await askBackupPassword({ title: 'نسخة احتياطية مشفرة' }); if (!p) return;
   toast('جارٍ التشفير…');
-  const file = await Sec.sealBackup(S.data, await Sec.makeBackupKey(p), { appVersion: C.APP_VERSION });
-  download(`folosi-backup-${C.today()}.json`, JSON.stringify(file), 'application/json'); exportedNow(); toast('تم تنزيل النسخة المشفرة');
+  const key = await Sec.makeBackupKey(p);
+  // المرفقات (اختياري): تُضمَّن داخل الملف المشفر نفسه فقط، ولا تُرفع لأي خدمة
+  let payload = S.data;
+  const atts = (S.data.attachments || []);
+  if (atts.length) {
+    const size = atts.reduce((s2, a) => s2 + (a.size || 0), 0);
+    if (await confirmBox({ title: 'تضمين المرفقات؟', text: `لديك ${atts.length} مرفق (${(size / 1048576).toFixed(1)} م.ب). تضمينها يجعل الملف أكبر لكنه يحفظ الفواتير والإيصالات أيضًا، مشفرة بنفس كلمة المرور.`, ok: 'تضمين', cancel: 'البيانات فقط' })) {
+      const files = {};
+      for (const a of atts) { const f = await Store.getAttachment(a.id, S.session); if (f?.bytes) files[a.id] = { type: f.type, b64: Sec.b64(f.bytes) }; }
+      payload = { ...S.data, __attachments: files };
+    }
+  }
+  const file = await Sec.sealBackup(payload, key, { appVersion: C.APP_VERSION });
+  // فحص سلامة قبل التنزيل: فك التشفير بنفس الكلمة ومطابقة المحتوى حرفيًا
+  try { const back = await Sec.openBackup(JSON.parse(JSON.stringify(file)), p, key); const { __attachments: bx, ...bd } = back; if (C.stateHash(bd) !== C.stateHash(S.data) || C.validateImport(bd).length || (payload.__attachments && Object.keys(bx || {}).length !== Object.keys(payload.__attachments).length)) throw new Error('mismatch'); }
+  catch { return toast('فشل فحص سلامة النسخة — لم تُنزَّل. أعد المحاولة', true); }
+  download(`folosi-backup-${C.today()}.json`, JSON.stringify(file), 'application/json'); exportedNow(); toast('تم تنزيل النسخة المشفرة بعد التحقق من سلامتها');
 }
 async function importFile(f) {
   if (f.size > 25 * 1048576) return toast('الملف كبير جدًا', true);
@@ -1106,16 +1142,63 @@ async function restoreObject(obj, source, cachedKey) {
       catch (e) { if (e.code === 'corrupt') return toast('الملف تالف أو معدّل — لم تتم الاستعادة', true); cachedKey = null; toast('كلمة المرور غير صحيحة', true); }
     }
   }
+  let attFiles = null;
+  if (data && data.__attachments) { attFiles = data.__attachments; const { __attachments, ...rest } = data; data = rest; }
+  if (data && data.integrity && !Sec.isEncryptedBackup(obj)) { // ملف JSON من 4.0: نتحقق من البصمة
+    const { exportedAt, app, appVersion, integrity, ...rest } = data;
+    if ((await B.sha256(JSON.stringify(rest))) !== integrity) return toast('الملف تالف أو معدّل (البصمة غير مطابقة) — لم تتم الاستعادة', true);
+    data = rest;
+  }
   const errs = C.validateImport(data);
   if (errs.length) return toast('الملف غير صالح: ' + errs[0], true);
   let up; try { up = C.upgrade(data); } catch { return toast('الملف غير متوافق', true); }
-  const ok = await confirmBox({ title: 'استبدال البيانات الحالية؟', text: `من ${source}: ${up.accounts.length} حسابات، ${up.transactions.length} عملية، ${up.projects.length} مشاريع، ${up.obligations.length} ديون. سيتم استبدال بيانات هذا الجهاز الحالية (${S.data.transactions.length} عملية) — مع الاحتفاظ بنسخة منها للتراجع.`, ok: 'استعادة' });
-  if (!ok) return;
+  if (!(await previewRestore(up, source))) return;
+  const pre = await Store.createSnapshot(S.data, S.session, 'pre-restore').catch(() => ({ ok: false }));
+  if (!pre.ok) return toast('تعذر حفظ نسخة من بياناتك الحالية — أُلغيت الاستعادة ولم يتغير شيء', true);
   const snap = S.session ? { vault: await Sec.sealVault(S.session, S.data) } : { data: S.data };
   await Store.setMeta('pre-restore', { at: new Date().toISOString(), ...snap }); S.hasPreRestore = true;
+  if (attFiles) for (const [id, f] of Object.entries(attFiles)) { try { await Store.putAttachment(id, Sec.unb64(f.b64), f.type, S.session); } catch {} }
   S.data = up; S.data.updatedAt = new Date().toISOString();
   await resetHistory(); // سجل التراجع يخص البيانات السابقة
   if (await save()) scheduleDrive(); closeSheet(); render(); toast('تمت الاستعادة بنجاح');
+}
+// معاينة ما سيتغير قبل أي استعادة
+const COUNT_LABEL = { accounts: 'الحسابات', transactions: 'العمليات', transfers: 'التحويلات', obligations: 'الديون', projects: 'المشاريع', goals: 'الأهداف', gold: 'قطع الذهب', trades: 'عمليات الاستثمار', investments: 'الاستثمارات' };
+function previewRestore(up, source) {
+  const cur = C.dataSummary(S.data), next = C.dataSummary(up), cmp = C.compareSummaries(cur, next);
+  return new Promise((resolve) => {
+    let done = false;
+    sheet('معاينة قبل الاستعادة', `
+      <p class="muted">المصدر: ${esc(source)}${next.updatedAt ? ` · آخر تعديل فيها ${esc(dt(next.updatedAt))}` : ''}${next.lastTx ? ` · آخر عملية ${esc(next.lastTx)}` : ''}</p>
+      <h3>ما تحتويه</h3><div class="chip-row">${Object.entries(next.counts).filter(([, v]) => v).map(([k, v]) => `<span class="tag">${COUNT_LABEL[k] || k}: ${v}</span>`).join('') || '<span class="tag">فارغة</span>'}</div>
+      <h3 style="margin-top:12px">الفرق عن بياناتك الحالية</h3>
+      ${cmp.counts.length || cmp.balances.length ? `<ul class="list">${cmp.counts.map((c) => `<li class="item"><div class="body"><div class="title">${COUNT_LABEL[c.key] || c.key}</div></div><div class="amt">${c.from} ← ${c.to}</div></li>`).join('')}
+        ${cmp.balances.map((b) => `<li class="item"><div class="body"><div class="title">${esc(b.name)}</div></div><div class="amt" style="font-size:14px">${b.from === null ? 'جديد' : plain(b.from, b.currency)} ← ${b.to === null ? 'غير موجود' : plain(b.to, b.currency)}</div></li>`).join('')}</ul>` : '<p class="muted">مطابقة لبياناتك الحالية.</p>'}
+      <div class="notice info">قبل الاستبدال تُحفظ نسخة محلية متحقق منها من بياناتك الحالية، ويمكنك الرجوع إليها من «النسخ الاحتياطية».</div>`, {
+      submit: 'استعادة هذه النسخة', danger: true, onSubmit: () => { done = true; resolve(true); },
+    });
+    $('sheet').addEventListener('close', () => { if (!done) resolve(false); }, { once: true });
+  });
+}
+// ---------- مركز النسخ الاحتياطية المحلية ----------
+async function openBackups() {
+  const list = [...(await Store.listSnapshots())].sort((a, b) => (a.at < b.at ? 1 : -1));
+  const ups = await Store.listUpgradeBackups(S.session).catch(() => []);
+  sheet('النسخ الاحتياطية على الجهاز', `
+    <p class="muted" style="font-size:14px">نسخ تلقائية يومية، وقبل كل عملية خطرة (استعادة، إصلاح، دمج)، ويدوية. كل نسخة تُفحص ببصمة SHA-256 قبل اعتمادها وقبل استعادتها${S.session ? '، وهي مشفرة بمفتاح قفلك' : ''}. هذه النسخ على هذا الجهاز فقط — احتفظ أيضًا بنسخة مشفرة خارجية.</p>
+    <button class="btn primary block" id="snapNow">إنشاء نسخة الآن</button>
+    <ul class="list" style="margin-top:10px">${list.map((m) => `<li class="item"><div class="body"><div class="title">${esc(dt(m.at))} ${m.bad ? '<span class="tag bad">تالفة</span>' : ''}</div><div class="sub">${esc(B.REASONS[m.reason] || m.reason)} · ${esc(B.formatSize(m.size))} · الإصدار ${esc(m.appVersion || '؟')}</div></div>${m.bad ? '' : `<button class="btn small" data-snap="${esc(m.key)}">معاينة</button>`}</li>`).join('') || '<li class="empty">لا توجد نسخ بعد</li>'}</ul>
+    ${ups.length ? `<h3 style="margin-top:14px">نسخ ما قبل تحديث الإصدار</h3><ul class="list">${ups.map((u) => `<li class="item"><div class="body"><div class="title">${esc(Store.UPGRADE_LABELS[u.key] || u.key)}</div><div class="sub">${esc(dt(u.savedAt))}${u.corrupt ? ' · <span class="bad">تعذر فتحها</span>' : ''}</div></div>${u.corrupt ? '' : `<button class="btn small" data-upgrade-backup="${esc(u.key)}">معاينة</button>`}</li>`).join('')}</ul>` : ''}`);
+  $('snapNow').onclick = async () => { const r = await Store.createSnapshot(S.data, S.session, 'manual'); r.ok ? (toast('تم إنشاء النسخة والتحقق منها'), openBackups()) : toast('تعذر إنشاء النسخة — المساحة قد تكون ممتلئة', true); };
+  $('sheetBody').querySelectorAll('[data-snap]').forEach((b) => (b.onclick = async () => {
+    const r = await Store.readSnapshot(b.dataset.snap, S.session);
+    if (!r.ok) { toast(r.code === 'locked' ? 'النسخة مشفرة بمفتاح غير متاح' : 'النسخة تالفة (البصمة غير مطابقة) — لا يمكن استعادتها، ولن تُستخدم', true); return openBackups(); }
+    await restoreObject(r.data, `نسخة ${B.REASONS[r.meta.reason] || ''} — ${dt(r.meta.at)}`);
+  }));
+  $('sheetBody').querySelectorAll('[data-upgrade-backup]').forEach((b) => (b.onclick = async () => {
+    const u = await Store.readUpgradeBackup(S.session, b.dataset.upgradeBackup); if (!u?.data) return toast('تعذر فتح النسخة', true);
+    await restoreObject(u.data, `نسخة ${Store.UPGRADE_LABELS[u.key]} (${dt(u.savedAt)})`);
+  }));
 }
 async function undoRestore() {
   const m = await Store.getMeta('pre-restore'); if (!m) return;
@@ -1125,37 +1208,7 @@ async function undoRestore() {
   if (!data) return;
   S.data = C.upgrade(data); S.data.updatedAt = new Date().toISOString(); await resetHistory(); await save(); await Store.setMeta('pre-restore', null); S.hasPreRestore = false; render(); toast('تم التراجع');
 }
-// ---------- فحص سلامة الأرصدة (قراءة فقط) ----------
-const SEV = { error: ['bad', 'خطأ مؤكد'], warn: ['warn', 'يحتاج مراجعة'], info: ['', 'للعلم'] };
-const FIX_LABEL = { unlink: 'إلغاء الربط (الحركة تبقى)', 'delete-tx': 'حذف هذه الحركة', 'drop-payment': 'حذف الدفعة الفارغة', 'recalc-paid': 'تحديث القيمة', reconcile: 'تسوية مع الكشف', 'review-initial': 'لم يحدث — احذف الحركة' };
-function openDiagnostics() {
-  const f = C.diagnose(S.data); S.diagFindings = f;
-  const order = { error: 0, warn: 1, info: 2 };
-  const rows = [...f].sort((a, b) => order[a.severity] - order[b.severity]).map((x) => `<li class="item" style="align-items:flex-start"><div class="body"><div class="title">${esc(x.title)} <span class="tag ${SEV[x.severity][0]}">${SEV[x.severity][1]}</span></div><div class="sub" style="white-space:normal;line-height:1.7">${esc(x.detail)}</div>
-    ${x.fix ? `<div class="actions" style="margin-top:6px"><button class="btn small" data-action="apply-fix" data-fid="${esc(x.id)}">${FIX_LABEL[x.fix.type] || 'إصلاح'}</button></div>` : ''}</div></li>`).join('');
-  const n = f.filter((x) => x.severity !== 'info').length;
-  sheet('فحص سلامة الأرصدة', `
-    <div class="notice ${n ? '' : 'info'}">${f.length ? `وُجدت ${f.length} ملاحظة (${n} تحتاج انتباهك). <b>لم يُغيَّر أي شيء.</b> كل إصلاح يحتاج ضغطة منك وتأكيدًا، ويمكن التراجع عنه بزر التراجع.` : 'لم تُكتشف أي مشكلة في الحسابات والديون والدفعات.'}</div>
-    ${f.length ? `<ul class="list">${rows}</ul>` : ''}
-    <p class="hint">لا يمكن للفحص معرفة الحركات المحذوفة سابقًا (مثل دفعات حُذفت مع دين في إصدار قديم). إن كان رصيد حساب لا يطابق كشف البنك فاستخدم «تسوية مع كشف البنك» من صفحة الحساب.</p>
-    <div class="actions"><button class="btn small" id="diagCopy">نسخ التقرير</button></div>`);
-  $('diagCopy').onclick = () => { const t = f.map((x) => `[${SEV[x.severity][1]}] ${x.title}: ${x.detail}`).join('\n') || 'لا توجد مشاكل'; navigator.clipboard?.writeText(`فحص فلوسي ${C.APP_VERSION} — ${C.today()}\n${t}`).then(() => toast('تم نسخ التقرير'), () => toast('تعذر النسخ', true)); };
-}
-async function applyFixFlow(fid) {
-  const x = (S.diagFindings || []).find((y) => y.id === fid); if (!x?.fix) return;
-  let fix = x.fix;
-  if (fix.type === 'reconcile') { closeSheet(); return openReconcile(fix.accountId); }
-  if (fix.type === 'review-initial') fix = { type: 'delete-tx', txId: fix.txId };
-  const t = fix.txId ? S.data.transactions.find((y) => y.id === fix.txId) : null, a = t ? acc(t.accountId) : null;
-  const effect = fix.type === 'delete-tx' && t ? `رصيد «${a?.name}» سيصبح ${plain(C.balance(S.data, a) + (t.type === 'income' ? -1 : 1) * t.amount, a.currency)} بدل ${plain(C.balance(S.data, a), a.currency)}.` : fix.type === 'unlink' ? 'الحركة تبقى كما هي ولا يتغير أي رصيد؛ فقط تُفصل عن السجل المحذوف.' : 'لا يتغير أي رصيد.';
-  if (!(await confirmBox({ title: FIX_LABEL[x.fix.type] + '؟', text: `${x.title}: ${x.detail} — ${effect} يمكنك التراجع بعدها.`, ok: 'تنفيذ', danger: fix.type === 'delete-tx' }))) return;
-  try { await commit((d) => C.applyFix(d, fix), 'تم الإصلاح', { label: `إصلاح: ${x.title}` }); openDiagnostics(); } catch (e) { toast(errText(e), true); }
-}
-async function restoreUpgradeBackup() {
-  let b; try { b = await Store.readUpgradeBackup(S.session); } catch { b = null; }
-  if (!b) return toast('لا توجد نسخة أمان من الإصدار السابق على هذا الجهاز', true);
-  await restoreObject(b.data, `نسخة الأمان قبل ${C.APP_VERSION} (${dt(b.savedAt)})`);
-}
+async function restoreUpgradeBackup() { return openBackups(); }
 async function retryBackup() {
   if (!S.upgradeRaw) { S.saveBlocked = false; return save(); }
   const r = await Store.backupBeforeUpgrade(S.upgradeRaw, S.session).catch(() => ({ ok: false }));
@@ -1440,6 +1493,7 @@ document.addEventListener('click', async (e) => {
   const b = e.target.closest('[data-action]'); if (!b) return;
   const id = b.dataset.id;
   try {
+    if (EXT.actions[b.dataset.action]) return await EXT.actions[b.dataset.action](b, id, e); // الوحدات الإضافية أولًا
     switch (b.dataset.action) {
       case 'quick-add': return openTx();
       case 'open-tx': return openTxDetail(id);
@@ -1452,16 +1506,14 @@ document.addEventListener('click', async (e) => {
       case 'open-account': return openAccount(id);
       case 'archive-account': { const a = acc(id), bal = C.balance(S.data, a);
         if (!a.archived && !(await confirmBox({ title: 'إغلاق/أرشفة الحساب؟', text: `«${a.name}» سيختفي من قوائم الاختيار، ويبقى كشفه ورصيده (${plain(bal, a.currency)}) محفوظين${bal ? ' ومحسوبين في الإجمالي' : ''}. لا تُحذف أي حركة، ويمكنك إعادة فتحه.`, ok: 'أرشفة' }))) return;
-        if (a.archived && S.data.accounts.some((x) => x.id !== id && !x.archived && x.name === a.name)) return toast(`يوجد حساب نشط باسم «${a.name}» — غيّر اسم أحدهما أولًا`, true);
         await commit((d) => C.updateAccount(d, id, { name: a.name, archived: !a.archived }), a.archived ? 'أُعيد فتح الحساب' : 'تمت الأرشفة', { label: `${a.archived ? 'إعادة فتح' : 'أرشفة'} الحساب «${a.name}»` }); return closeSheet(); }
       case 'del-account': return deleteAccountFlow(id);
-      case 'reconcile': return openReconcile(id);
+      case 'reconcile': return EXT.actions['bank-match'](b, id);
       case 'undo': return undoRedo(false);
       case 'redo': return undoRedo(true);
-      case 'diagnostics': closeSheet(); return openDiagnostics();
+      case 'diagnostics': closeSheet(); return go('integrity');
       case 'dismiss-diag': S.diagDismissed = true; return renderBanners();
-      case 'apply-fix': return applyFixFlow(b.dataset.fid);
-      case 'restore-upgrade-backup': return restoreUpgradeBackup();
+      case 'restore-upgrade-backup': case 'backups': closeSheet(); return openBackups();
       case 'retry-backup': return retryBackup();
       case 'edit-payment': return openPayment(b.dataset.kind, id, b.dataset.pid);
       case 'archive-item': { const coll = b.dataset.kind === 'project' ? S.data.projects : S.data.obligations, it = coll.find((x) => x.id === id); if (!it) return;
@@ -1601,10 +1653,19 @@ async function start(data, raw) {
   readHash(); render(); updateThemeColor(); netStatus();
   save();
   Store.getMeta('pre-restore').then((m) => { S.hasPreRestore = !!m; });
+  if (!S.saveBlocked) Store.ensureDailySnapshot(S.data, S.session).catch(() => {});
+  for (const fn of CTX.onStart || []) try { fn(); } catch (e) { console.warn('[folosi] start hook', e?.name); }
   if (S.session) Store.syncSideStores(S.session, S.session).catch(() => {});
   if (FX.isStale(S.rates, 12)) refreshRates(false);
   if (IS_LOCAL) window.__folosi = { get data() { return S.data; }, get session() { return !!S.session; }, get history() { return S.history; }, setRates: (r) => { S.rates = r; render(); } };
 }
+// ---------- سياق الوحدات الإضافية ----------
+const CTX = { S, $, esc, money, plain, nf, sym, toast, sheet, closeSheet, confirmBox, modal, commit, save, render, go, head, icon, acc, accountOptions, currencyOptions,
+  dt, dateLabel, monthLabel, disp, errText, download, missingNote, pick, setPick, rateHint, curName, renderBanners, C, Store, B,
+  runAction: (action, id) => { const b = document.createElement('button'); b.dataset.action = action; b.dataset.id = id; b.hidden = true; document.body.append(b); b.click(); b.remove(); } };
+for (const mod of [UIX, UIW, UIM]) {
+  const r = mod.register(CTX);
+  for (const v of Object.keys(r.views || {})) if (!$('v-' + v)) { const sec = document.createElement('section'); sec.className = 'view'; sec.id = 'v-' + v; document.querySelector('main').append(sec); } Object.assign(EXT.views, r.views || {}); Object.assign(EXT.actions, r.actions || {}); Object.assign(EXT.nav, r.nav || {}); }
 async function boot() {
   netStatus();
   Sec.passkeyAvailable().then((v) => { S.passkeyOK = v; if (S.view === 'settings' && S.data) renderSettings(); });

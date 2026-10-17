@@ -1,7 +1,8 @@
 // فلوسي — الحفظ المحلي. نسختان متزامنتان: IndexedDB (الأساس) + localStorage (نسخة مرآة)
 // نفس قاعدة البيانات والمفاتيح المستخدمة منذ الإصدار 2.0 حتى لا تضيع بيانات أحد.
-import { STORAGE_KEYS as K, upgrade, migrateV1, isStructurallyValid, SCHEMA } from './core.js';
-import { sealVault, openWithSession } from './security.js';
+import { STORAGE_KEYS as K, upgrade, migrateV1, isStructurallyValid, SCHEMA, APP_VERSION } from './core.js';
+import * as B from './backup.js';
+import { sealVault, openWithSession, sealBytes, openBytes, b64, unb64 } from './security.js';
 
 const DB_NAME = 'folosi-store', STORE = 'snapshots';
 let db = null;
@@ -139,14 +140,21 @@ export async function wipeAll() {
 // المخازن الجانبية (نسخة ما قبل الترحيل، نسخة ما قبل الاستعادة، بيانات الإصدار الأول) تتبع حالة القفل:
 // مشفرة عند تفعيل القفل، ومفتوحة عند إيقافه — دون حذف أي محتوى.
 export async function syncSideStores(fromSession, toSession) {
-  const seal = async (data) => (toSession ? { vault: await sealVault(toSession, { ...data, updatedAt: data.updatedAt || new Date().toISOString() }) } : { data });
+  const seal = async (data) => (toSession ? { vault: await sealVault(toSession, data) } : { data }); // المحتوى كما هو حرفيًا (بصمات النسخ تبقى صالحة)
   const plainOf = async (rec) => (rec?.vault ? (fromSession ? openWithSession(rec.vault, fromSession) : null) : rec?.data ?? null);
-  for (const key of ['backup-before-v3', BACKUP_31, HISTORY, 'meta:pre-restore', 'legacy-v1']) {
+  const snaps = (await listSnapshots()).map((m) => m.key);
+  for (const key of [...UPGRADE_KEYS, HISTORY, AUDIT, 'meta:pre-restore', 'legacy-v1', ...snaps]) {
     const rec = await idbGet(key); if (!rec) continue;
     if (!!rec.vault === !!toSession && (!rec.vault || !fromSession || fromSession.raw === toSession?.raw)) continue; // الحالة صحيحة أصلًا
     let data; try { data = await plainOf(rec); } catch { continue; }
     if (!data) continue;
     await idbPut(key, { ...rec, data: undefined, vault: undefined, ...(await seal(data)) });
+  }
+  if (snaps.length) { const list = await listSnapshots(); await writeIndex(list.map((m) => ({ ...m, sealed: !!toSession }))); }
+  // المرفقات تتبع حالة القفل أيضًا
+  for (const id of await listAttachmentIds()) {
+    const rec = await idbGet('att:' + id); if (!rec || !!rec.sealed === !!toSession) continue;
+    try { const bytes = rec.sealed ? (fromSession ? await openBytes(fromSession, rec.box) : null) : unb64(rec.b64); if (!bytes) continue; await idbPut('att:' + id, await attRecord(bytes, rec.type, toSession)); } catch {}
   }
   const legacy = lsGet(K.legacy);
   if (legacy && toSession) {
@@ -156,36 +164,105 @@ export async function syncSideStores(fromSession, toSession) {
 
 // ---------- نسخة أمان قبل ترحيل 3.1 ----------
 // تُنشأ مرة واحدة من البيانات كما كانت قبل الترقية، ولا تُستبدل أبدًا. مشفرة إن كان القفل مفعّلًا.
+// مفتاح لكل ترقية بنية — لا تُستبدل نسخة ترقية سابقة أبدًا
 export const BACKUP_31 = 'backup-before-3.1';
+export const UPGRADE_KEY = 'backup-before-4.0';
+export const UPGRADE_KEYS = ['backup-before-v3', BACKUP_31, UPGRADE_KEY];
+export const UPGRADE_LABELS = { 'backup-before-v3': 'قبل الإصدار 3.0', [BACKUP_31]: 'قبل الإصدار 3.1', [UPGRADE_KEY]: 'قبل الإصدار 4.0' };
 export async function backupBeforeUpgrade(raw, session) {
   if (!raw || (Number(raw.schema) || 2) >= SCHEMA) return { ok: true, skipped: true };
-  const existing = await idbGet(BACKUP_31);
+  const existing = await idbGet(UPGRADE_KEY);
   if (existing) return { ok: true, existed: true };
   const rec = { savedAt: new Date().toISOString(), fromSchema: Number(raw.schema) || 2,
     ...(session ? { vault: await sealVault(session, { ...raw, updatedAt: raw.updatedAt || new Date().toISOString() }) } : { data: raw }) };
-  try { await idbPut(BACKUP_31, rec); } catch { return { ok: false }; }
-  const back = await idbGet(BACKUP_31); // تحقق أن النسخة كُتبت فعلًا قبل السماح بالحفظ فوقها
-  return { ok: !!back };
+  try { await idbPut(UPGRADE_KEY, rec); } catch { return { ok: false }; }
+  const back = await idbGet(UPGRADE_KEY); // تحقق أن النسخة كُتبت وتُقرأ فعلًا قبل السماح بالحفظ فوقها
+  if (!back) return { ok: false };
+  try { const d = back.vault ? await openWithSession(back.vault, session) : back.data; if (!isStructurallyValid(d)) return { ok: false }; } catch { return { ok: false }; }
+  return { ok: true };
 }
-export async function readUpgradeBackup(session) {
-  const rec = await idbGet(BACKUP_31); if (!rec) return null;
-  const data = rec.vault ? (session ? await openWithSession(rec.vault, session) : null) : rec.data;
-  return data ? { savedAt: rec.savedAt, fromSchema: rec.fromSchema, data } : null;
+export async function readUpgradeBackup(session, key = UPGRADE_KEY) {
+  const rec = await idbGet(key); if (!rec) return null;
+  let data = null;
+  try { data = rec.vault ? (session ? await openWithSession(rec.vault, session) : null) : rec.data; } catch { return { key, savedAt: rec.savedAt, corrupt: true }; }
+  return data ? { key, savedAt: rec.savedAt, fromSchema: rec.fromSchema ?? data.schema, data } : null;
+}
+export async function listUpgradeBackups(session) {
+  const out = [];
+  for (const k of UPGRADE_KEYS) { const b = await readUpgradeBackup(session, k).catch(() => null); if (b) out.push(b); }
+  return out;
 }
 
 // ---------- سجل التراجع (آخر 5 عمليات) ----------
 // يحتوي لقطات كاملة من بياناتك، لذلك يُشفَّر بنفس مفتاح الخزنة عند تفعيل القفل ولا يُحفظ أبدًا كنص مقروء في وضع القفل.
 // لا يُنسخ إلى localStorage ولا إلى Google Drive ولا يدخل في ملفات النسخ الاحتياطي.
-const HISTORY = 'history';
-export async function saveHistory(h, session) {
-  const rec = session ? { vault: await sealVault(session, { ...h, updatedAt: new Date().toISOString() }) } : { data: h };
-  try { await idbPut(HISTORY, { savedAt: new Date().toISOString(), ...rec }); return true; } catch { return false; }
+const HISTORY = 'history', AUDIT = 'audit';
+// مخزن جانبي يتبع حالة القفل: مشفر بمفتاح الخزنة عند القفل، ولا يُقبل نص مقروء في وضع القفل
+async function saveSealed(key, obj, session) {
+  const rec = session ? { vault: await sealVault(session, { ...obj, updatedAt: new Date().toISOString() }) } : { data: obj };
+  try { await idbPut(key, { savedAt: new Date().toISOString(), ...rec }); return true; } catch { return false; }
 }
+async function loadSealed(key, session) {
+  const rec = await idbGet(key); if (!rec) return null;
+  try { return rec.vault ? (session ? await openWithSession(rec.vault, session) : null) : (session ? null : rec.data); } catch { return null; }
+}
+export const saveHistory = (h, session) => saveSealed(HISTORY, h, session);
 export async function loadHistory(session) {
-  const rec = await idbGet(HISTORY); if (!rec) return null;
-  try {
-    const h = rec.vault ? (session ? await openWithSession(rec.vault, session) : null) : (session ? null : rec.data); // سجل غير مشفر لا يُقبل في وضع القفل
-    return h && Array.isArray(h.undo) && Array.isArray(h.redo) ? { v: 1, undo: h.undo, redo: h.redo } : null;
-  } catch { return null; }
+  const h = await loadSealed(HISTORY, session);
+  return h && Array.isArray(h.undo) && Array.isArray(h.redo) ? { v: 1, undo: h.undo, redo: h.redo } : null;
 }
 export const clearHistory = () => idbDel(HISTORY);
+// سجل التعديلات (منفصل عن التراجع)
+export const saveAudit = (a, session) => saveSealed(AUDIT, a, session);
+export async function loadAudit(session) { const a = await loadSealed(AUDIT, session); return a && Array.isArray(a.entries) ? { v: 1, entries: a.entries } : null; }
+
+// ---------- النسخ المحلية متعددة الإصدارات ----------
+const SNAP_INDEX = 'meta:snapshots';
+export async function listSnapshots() { const r = await idbGet(SNAP_INDEX); return Array.isArray(r?.list) ? r.list : []; }
+const writeIndex = (list) => idbPut(SNAP_INDEX, { list });
+const opener = (session) => (session ? (v) => openWithSession(v, session) : null);
+let snapChain = Promise.resolve();
+export function createSnapshot(data, session, reason = 'manual') {
+  const job = snapChain.then(() => doSnapshot(data, session, reason));
+  snapChain = job.catch(() => {});
+  return job;
+}
+async function doSnapshot(data, session, reason) {
+  if (!data || !isStructurallyValid(data)) return { ok: false, code: 'invalid' };
+  let made;
+  try { made = await B.makeRecord(data, { seal: session ? (d) => sealVault(session, d) : null, appVersion: APP_VERSION, reason }); } catch { return { ok: false, code: 'seal' }; }
+  try { await idbPut(made.key, made.record); } catch { return { ok: false, code: 'write' }; }
+  const v = await B.verifyRecord(await idbGet(made.key), made.meta, { open: opener(session) });
+  if (!v.ok) { await idbDel(made.key); return { ok: false, code: v.code }; } // لا تُعتمد نسخة غير سليمة، ولا يُحذف شيء قديم
+  const list = [...(await listSnapshots()), made.meta];
+  const drop = B.planRotation(list);
+  try { await writeIndex(list.filter((m) => !drop.includes(m.key))); } catch { return { ok: false, code: 'write' }; }
+  for (const k of drop) await idbDel(k);
+  return { ok: true, meta: made.meta };
+}
+export async function readSnapshot(key, session) {
+  const list = await listSnapshots(), meta = list.find((m) => m.key === key);
+  if (!meta) return { ok: false, code: 'missing' };
+  const r = await B.verifyRecord(await idbGet(key), meta, { open: opener(session) });
+  if (!r.ok && r.code !== 'locked' && !meta.bad) { meta.bad = true; await writeIndex(list).catch(() => {}); }
+  return { ...r, meta };
+}
+export async function ensureDailySnapshot(data, session) {
+  if (!B.needsDaily(await listSnapshots())) return { ok: true, skipped: true };
+  return createSnapshot(data, session, 'auto');
+}
+
+// ---------- المرفقات (فواتير، إيصالات، كشوف) ----------
+// المحتوى في IndexedDB فقط، مشفر بمفتاح الخزنة عند القفل، ولا يُرفع لأي خدمة.
+const ATT_INDEX = 'meta:attachments';
+export async function listAttachmentIds() { const r = await idbGet(ATT_INDEX); return Array.isArray(r?.ids) ? r.ids : []; }
+async function attRecord(bytes, type, session) { return session ? { sealed: true, type, size: bytes.length, box: await sealBytes(session, bytes) } : { sealed: false, type, size: bytes.length, b64: b64(bytes) }; }
+export async function putAttachment(id, bytes, type, session) {
+  await idbPut('att:' + id, await attRecord(bytes, type, session));
+  const ids = await listAttachmentIds(); if (!ids.includes(id)) await idbPut(ATT_INDEX, { ids: [...ids, id] });
+  return true;
+}
+export async function getAttachment(id, session) {
+  const rec = await idbGet('att:' + id); if (!rec) return null;
+  try { return { type: rec.type, bytes: rec.sealed ? (session ? await openBytes(session, rec.box) : null) : unb64(rec.b64) }; } catch { return null; }
+}

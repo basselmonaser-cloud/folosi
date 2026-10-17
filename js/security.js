@@ -95,6 +95,9 @@ async function openWithRaw(vault, raw) {
   return { data, session: { raw, keys: { ...vault.keys } } };
 }
 // يفتح نسخة مختومة بنفس مفتاح البيانات للجلسة الحالية (المفتاح لا يتغير عند تغيير الرمز)
+// المرفقات: تشفير بايتات الملف بمفتاح الخزنة نفسه (AES-GCM)
+export async function sealBytes(session, bytes) { return encryptBytes(await importRaw(session.raw), new Uint8Array(bytes), 'folosi-attachment'); }
+export async function openBytes(session, box) { return decryptBytes(await importRaw(session.raw), box, 'folosi-attachment'); }
 export async function openWithSession(vault, session) { return decryptJSON(await importRaw(session.raw), vault, 'folosi-vault'); }
 export async function changeSecret(session, secret, kind) { session.keys.pin = await wrapWithSecret(session.raw, secret, PIN_ITERATIONS, kind); }
 export async function regenerateRecovery(session) {

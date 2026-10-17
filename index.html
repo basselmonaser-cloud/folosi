@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://accounts.google.com/gsi/; style-src 'self' 'unsafe-inline' https://accounts.google.com/gsi/; connect-src 'self' https://open.er-api.com https://cdn.jsdelivr.net https://www.googleapis.com https://accounts.google.com/gsi/; frame-src https://accounts.google.com/gsi/; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://accounts.google.com/gsi/; style-src 'self' 'unsafe-inline' https://accounts.google.com/gsi/; connect-src 'self' https://open.er-api.com https://cdn.jsdelivr.net https://api.gold-api.com https://api.twelvedata.com https://www.googleapis.com https://accounts.google.com/gsi/; frame-src https://accounts.google.com/gsi/; img-src 'self' data: blob:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <meta name="theme-color" content="#f3f6fa" id="themeColor">
 <meta name="description" content="فلوسي — مديرك المالي الشخصي. يعمل على جهازك دون إنترنت ودون حساب.">
@@ -35,6 +35,9 @@
   <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></symbol>
   <symbol id="i-undo" viewBox="0 0 24 24"><path d="M15 14l5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/></symbol>
   <symbol id="i-redo" viewBox="0 0 24 24"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></symbol>
+  <symbol id="i-gold" viewBox="0 0 24 24"><path d="M7 10h10l3 5H4z"/><path d="M4 15h16v4H4z"/><path d="M9 6h6l1.5 4h-9z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></symbol>
+  <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 16V11a6 6 0 0 1 12 0v5l2 2H4z"/><path d="M10 20a2 2 0 0 0 4 0"/></symbol>
   <symbol id="i-back" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
   <symbol id="i-lock" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></symbol>
   <symbol id="i-arrow-in" viewBox="0 0 24 24"><path d="M12 5v14M5 12l7 7 7-7"/></symbol>
@@ -64,12 +67,15 @@
     <section class="view" id="v-settings"></section>
     <section class="view" id="v-detail"></section>
     <section class="view" id="v-converter"></section>
+    <section class="view" id="v-audit"></section>
+    <section class="view" id="v-integrity"></section>
+    <section class="view" id="v-statement"></section>
   </main>
   <nav class="bottom-nav" aria-label="التنقل الرئيسي"><div class="in">
     <button class="nav-btn" data-nav="home"><svg class="i"><use href="#i-home"/></svg>الرئيسية</button>
     <button class="nav-btn" data-nav="history"><svg class="i"><use href="#i-list"/></svg>العمليات</button>
     <button class="nav-add" data-action="quick-add" aria-label="إضافة عملية"><svg class="i" style="width:28px;height:28px"><use href="#i-plus"/></svg></button>
-    <button class="nav-btn" data-nav="reports"><svg class="i"><use href="#i-chart"/></svg>التقارير</button>
+    <button class="nav-btn" data-nav="wealth"><svg class="i"><use href="#i-gold"/></svg>ثروتي</button>
     <button class="nav-btn" data-nav="more"><svg class="i"><use href="#i-grid"/></svg>المزيد</button>
   </div></nav>
 </div>
