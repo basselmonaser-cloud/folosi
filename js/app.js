@@ -11,7 +11,8 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const S = { data: null, session: null, rates: FX.loadRates(), view: 'home', param: '', saveOk: null, lastSave: null, migratedFrom: null,
   hist: { type: 'all', account: 'all', month: '', q: '' }, debtTab: 'receivable', rep: { mode: 'month', month: C.today().slice(0, 7), year: C.today().slice(0, 4) },
-  drive: readJSON(K.drive) || {}, driveKey: null, drivePending: false, reg: null, updateReady: null, passkeyOK: false, lastActivity: Date.now(), hiddenAt: 0 };
+  drive: readJSON(K.drive) || {}, driveKey: null, drivePending: false, reg: null, updateReady: null, passkeyOK: false, lastActivity: Date.now(), hiddenAt: 0,
+  history: C.emptyHistory(), saveBlocked: false, debtStatus: 'active' };
 function readJSON(k) { try { return JSON.parse(Store.lsGet(k) || 'null'); } catch { return null; } }
 const IS_LOCAL = ['localhost', '127.0.0.1'].includes(location.hostname);
 
@@ -122,6 +123,7 @@ function rateHint(from, to) {
 // ---------- الحفظ ----------
 async function save(opts) {
   if (!S.data || S.locking) return false;
+  if (S.saveBlocked) { renderBanners(); return false; } // لا حفظ فوق البيانات القديمة قبل نجاح نسخة الأمان
   try {
     const r = await Store.persist(S.data, S.session, opts);
     S.saveOk = r.ok; S.lastSave = new Date(); S.saveWarn = r.ok && (!r.idb || !r.ls);
@@ -134,17 +136,46 @@ async function save(opts) {
   return S.saveOk;
 }
 // كل تعديل يمر من هنا: إن فشل التحقق تعود البيانات كما كانت تمامًا
-async function commit(fn, msg) {
+// كل عملية مالية تُسجل في سجل التراجع كوحدة واحدة (مع كل ما يرتبط بها). الإعدادات لا تُسجل.
+async function commit(fn, msg, { label, history = true } = {}) {
+  if (S.saveBlocked) throw new C.ValidationError('الحفظ موقوف حتى تنجح نسخة الأمان — راجع التنبيه أعلى الشاشة');
   const snapshot = JSON.stringify(S.data);
   let result;
   try { result = fn(S.data); } catch (e) { S.data = JSON.parse(snapshot); throw e; }
   S.data.updatedAt = new Date().toISOString();
+  if (history) S.history = C.recordHistory(S.history, label || msg || 'تعديل', snapshot, S.data);
   render();
   const ok = await save();
-  if (ok) scheduleDrive();
+  if (ok) { scheduleDrive(); if (history) await Store.saveHistory(S.history, S.session); }
   if (msg) ok ? toast(msg) : toast('تعذر الحفظ على هذا الجهاز!', true);
   return result;
 }
+// ---------- التراجع والإعادة ----------
+function renderUndo() {
+  const u = S.history.undo.at(-1), r = S.history.redo.at(-1);
+  const ub = $('undoBtn'), rb = $('redoBtn'); if (!ub) return;
+  ub.disabled = !u || !S.data; rb.disabled = !r || !S.data;
+  ub.title = u ? `تراجع عن: ${u.label} (${S.history.undo.length} من ${C.HISTORY_LIMIT})` : 'لا توجد عمليات للتراجع عنها';
+  rb.title = r ? `إعادة: ${r.label}` : 'لا توجد عمليات لإعادتها';
+  ub.setAttribute('aria-label', ub.title); rb.setAttribute('aria-label', rb.title);
+}
+async function undoRedo(redo = false) {
+  if (S.busyUndo) return; S.busyUndo = true;
+  try {
+    const stored = await Store.loadHistory(S.session); if (stored) S.history = stored; // أحدث نسخة من السجل
+    const r = (redo ? C.redoHistory : C.undoHistory)(S.history, S.data);
+    if (!r.ok) { renderUndo(); return toast(r.reason, true); }
+    const diff = C.balanceDiff(S.data, r.data);
+    const lines = diff.map((x) => x.added ? `«${x.name}» سيعود (${plain(x.to, x.currency)})` : x.removed ? `«${x.name}» سيُزال` : `«${x.name}»: ${plain(x.from, x.currency)} ← ${plain(x.to, x.currency)}`);
+    const ok = await confirmBox({ title: redo ? 'إعادة العملية؟' : 'التراجع عن آخر عملية؟', text: `${redo ? 'إعادة' : 'التراجع عن'}: «${r.label}». ${lines.length ? 'أثرها على الأرصدة: ' + lines.join('، ') + '.' : 'لا تغيّر أرصدة الحسابات.'} ستعود كل الحسابات والحركات والديون المرتبطة بها معًا.`, ok: redo ? 'إعادة' : 'تراجع' });
+    if (!ok) return;
+    S.data = r.data; S.data.updatedAt = new Date().toISOString(); S.history = r.history;
+    closeSheet(); render();
+    if (await save()) { scheduleDrive(); await Store.saveHistory(S.history, S.session); toast(redo ? `تمت الإعادة: ${r.label}` : `تم التراجع عن: ${r.label}`); }
+    else toast('تعذر الحفظ على هذا الجهاز!', true);
+  } finally { S.busyUndo = false; renderUndo(); }
+}
+async function resetHistory() { S.history = C.emptyHistory(); await Store.clearHistory(); renderUndo(); }
 function renderStatus() {
   const el = $('saveStatus');
   if (S.saveOk === false) { el.textContent = 'لم يُحفظ!'; el.className = 'status err'; return; }
@@ -169,13 +200,15 @@ function render() {
   document.querySelectorAll('[data-nav]').forEach((b) => (b.dataset.nav === nav ? b.setAttribute('aria-current', 'page') : b.removeAttribute('aria-current')));
   ({ home: renderHome, history: renderHistory, accounts: renderAccounts, clients: renderClients, debts: renderDebts, goals: renderGoals,
     recurring: renderRecurring, reports: renderReports, more: renderMore, settings: renderSettings, detail: renderDetail, converter: renderConverter })[S.view]();
-  renderStatus(); renderBanners();
+  renderStatus(); renderBanners(); renderUndo();
 }
 const head = (title, back = 'more', extra = '') => `<div class="view-head"><button class="back" data-nav-to="${back}" aria-label="رجوع">${icon('i-back')}</button><h2>${esc(title)}</h2>${extra}</div>`;
 
 // ---------- البانرات ----------
 function renderBanners() {
   const b = [];
+  if (S.saveBlocked) b.push(`<div class="notice err"><b>لم يُحفظ أي تغيير.</b> قبل تحديث بياناتك إلى الإصدار ${C.APP_VERSION} يجب حفظ نسخة أمان منها، وتعذر ذلك على هذا الجهاز (قد تكون المساحة ممتلئة). بياناتك القديمة لم تُلمس. نزّل نسخة احتياطية ثم أعد المحاولة.<div class="actions"><button class="btn small" data-action="retry-backup">إعادة المحاولة</button><button class="btn small" data-action="export-enc">نسخة مشفرة</button></div></div>`);
+  if (S.view === 'home' && !S.diagDismissed && S.data) { const n = C.diagnose(S.data).filter((f) => f.severity !== 'info').length; if (n) b.push(`<div class="notice">وجد فحص الأرصدة <b>${n}</b> ${n === 1 ? 'ملاحظة' : 'ملاحظات'} قد تجعل رصيدًا غير صحيح. لم يُغيَّر أي شيء تلقائيًا.<div class="actions"><button class="btn small" data-action="diagnostics">عرض الفحص</button><button class="btn small" data-action="dismiss-diag">لاحقًا</button></div></div>`); }
   if (BETA) b.push('<div class="notice"><b>نسخة تجريبية للاختبار فقط.</b> منفصلة تمامًا عن تطبيقك الحقيقي — لا تُدخل بياناتك المالية الحقيقية هنا.</div>');
   if (S.saveOk === false) b.push(`<div class="notice err"><b>لم يتم حفظ آخر تعديل على هذا الجهاز.</b> قد تكون مساحة التخزين ممتلئة أو أن المتصفح في وضع التصفح الخاص. لا تغلق التطبيق قبل تنزيل نسخة احتياطية.<div class="actions"><button class="btn small" data-action="retry-save">إعادة المحاولة</button><button class="btn small" data-action="export-json">تنزيل نسخة</button></div></div>`);
   else if (S.saveWarn) b.push(`<div class="notice">تم الحفظ في مخزن واحد فقط من مخزني الجهاز. يُنصح بتنزيل نسخة احتياطية.</div>`);
@@ -414,15 +447,18 @@ function renderAccounts() {
 }
 function openAccount(id) {
   const a = id ? acc(id) : null, inUse = a ? C.accountInUse(S.data, a.id) : false;
+  const usage = a ? C.accountUsage(S.data, a.id) : null;
   const presets = C.ACCOUNT_PRESETS.filter((p) => !S.data.accounts.some((x) => x.name === p.name));
   sheet(a ? 'تعديل الحساب' : 'إضافة حساب', `
     ${!a && presets.length ? `<label>اختيار سريع</label><div class="chips">${presets.map((p) => `<button type="button" class="chip" data-preset="${esc(p.name)}" data-ptype="${p.type}">${esc(p.name)}</button>`).join('')}</div>` : ''}
     <label for="aName">اسم الحساب (بنك، محفظة، كاش…)</label><input id="aName" name="name" required maxlength="80" value="${esc(a?.name || '')}">
     <div class="grid2"><div><label>النوع</label><select name="type">${Object.entries(C.ACCOUNT_TYPES).map(([k, v]) => `<option value="${k}"${(a?.type || 'bank') === k ? ' selected' : ''}>${v}</option>`).join('')}</select></div>
     <div><label>العملة</label><select name="currency" ${inUse ? 'disabled' : ''}>${currencyOptions(a?.currency || disp())}</select></div></div>
+    ${a ? `<div class="kpis"><div><small>الرصيد الحالي</small><b>${money(C.balance(S.data, a), a.currency)}</b></div><div><small>الحركات</small><b>${usage.transactions + usage.transfers}</b></div></div>` : ''}
     <label for="aOpen">${a ? 'الرصيد الافتتاحي' : 'الرصيد الحالي'}</label><input id="aOpen" name="opening" inputmode="decimal" value="${esc(a ? a.opening : '0')}">
-    <div class="hint">${a ? `الرصيد الحالي ${plain(C.balance(S.data, a), a.currency)} = الافتتاحي + العمليات والتحويلات.` : 'اكتب الرصيد الموجود فعليًا في الحساب الآن. للسالب اكتب علامة - قبل الرقم.'}${inUse ? ' لا يمكن تغيير عملة حساب عليه عمليات.' : ''}</div>
-    ${a ? `<div class="actions"><button type="button" class="btn small" data-action="archive-account" data-id="${esc(a.id)}">${a.archived ? 'إلغاء الأرشفة' : 'أرشفة'}</button>${inUse ? '' : `<button type="button" class="btn small ghost-danger" data-action="del-account" data-id="${esc(a.id)}">حذف الحساب</button>`}<button type="button" class="btn small" data-action="account-history" data-id="${esc(a.id)}">عمليات الحساب</button></div>` : ''}`, {
+    <div class="hint" id="aOpenHint">${a ? `الافتتاحي = رصيد الحساب <b>قبل</b> أول عملية مسجلة هنا، وليس رصيدك اليوم. لمطابقة رصيدك مع كشف البنك استخدم «تسوية مع الكشف».` : 'اكتب الرصيد الموجود فعليًا في الحساب الآن. للسالب اكتب علامة - قبل الرقم.'}${inUse ? ' لا يمكن تغيير عملة حساب عليه عمليات.' : ''}</div>
+    ${a ? `<div class="actions"><button type="button" class="btn small" data-action="reconcile" data-id="${esc(a.id)}">تسوية مع كشف البنك</button><button type="button" class="btn small" data-action="account-history" data-id="${esc(a.id)}">كشف الحساب</button></div>
+      <div class="actions"><button type="button" class="btn small" data-action="archive-account" data-id="${esc(a.id)}">${a.archived ? 'إعادة فتح الحساب' : 'إغلاق/أرشفة الحساب'}</button><button type="button" class="btn small ghost-danger" data-action="del-account" data-id="${esc(a.id)}">حذف الحساب…</button></div>` : ''}`, {
     submit: a ? 'حفظ' : 'إضافة الحساب',
     onReady: (body, form) => {
       body.querySelectorAll('[data-preset]').forEach((b) => (b.onclick = () => { form.elements.name.value = b.dataset.preset; form.elements.type.value = b.dataset.ptype; form.dataset.typeTouched = '1'; }));
@@ -431,8 +467,67 @@ function openAccount(id) {
       form.elements.type.addEventListener('change', () => (form.dataset.typeTouched = '1'));
       form.elements.name.addEventListener('input', () => { if (form.dataset.typeTouched) return; const t = C.guessAccountType(form.elements.name.value); if (t) form.elements.type.value = t; });
     },
-    onSubmit: (v) => commit((d) => (a ? C.updateAccount(d, a.id, { ...v, currency: inUse ? undefined : v.currency }) : C.addAccount(d, v)), a ? 'تم حفظ الحساب' : 'تمت إضافة الحساب'),
+    onChange: (form) => {
+      if (!a) return;
+      const n = C.parseAmount(form.elements.opening.value.replace(/^-/, '')), raw = form.elements.opening.value.trim();
+      if (!raw || Number.isNaN(n) || Number(a.opening) === (raw.startsWith('-') ? -n : n)) return;
+      try { const pv = C.previewOpening(S.data, a.id, raw); $('aOpenHint').innerHTML = `<b>معاينة:</b> الرصيد الحالي ${money(pv.current, a.currency)} سيصبح ${money(pv.next, a.currency)} (${money(pv.delta, a.currency, { sign: true })}). كل الحركات تبقى كما هي.`; } catch {}
+    },
+    onSubmit: async (v) => {
+      if (a) {
+        const pv = String(v.opening).trim() !== String(a.opening) ? C.previewOpening(S.data, a.id, v.opening) : null;
+        if (pv && pv.delta !== 0 && !(await confirmBox({ title: 'تعديل الرصيد الافتتاحي؟', text: `رصيد «${a.name}» سيتغير من ${plain(pv.current, a.currency)} إلى ${plain(pv.next, a.currency)} (فرق ${plain(pv.delta, a.currency)}). إن كنت تريد مطابقة الرصيد مع كشف البنك فالأفضل «تسوية مع كشف البنك». يمكنك التراجع لاحقًا.`, ok: 'حفظ التعديل' }))) return false;
+        return commit((d) => C.updateAccount(d, a.id, { ...v, currency: inUse ? undefined : v.currency }), 'تم حفظ الحساب', { label: pv ? `تعديل الرصيد الافتتاحي لـ«${a.name}»` : `تعديل الحساب «${a.name}»` });
+      }
+      return commit((d) => C.addAccount(d, v), 'تمت إضافة الحساب', { label: `إضافة الحساب «${v.name}»` });
+    },
   });
+}
+// تسوية الرصيد مع كشف البنك عبر حركة تسوية واضحة (لا تُحتسب دخلًا ولا مصروفًا)
+function openReconcile(id) {
+  const a = acc(id); if (!a) return;
+  const cur = C.balance(S.data, a);
+  sheet(`تسوية «${a.name}» مع الكشف`, `
+    <p class="muted">الرصيد في فلوسي: ${money(cur, a.currency)}</p>
+    <label for="rcS">الرصيد الفعلي في كشف البنك/المحفظة (${esc(a.currency)})</label><input id="rcS" name="statement" class="amount-input" inputmode="decimal" required placeholder="0">
+    <div class="hint" id="rcH">ستُضاف حركة «تسوية رصيد» بالفرق فقط، ولا تُحتسب دخلًا أو مصروفًا في التقارير. لا يتغير الافتتاحي ولا أي حركة سابقة.</div>
+    <div class="grid2"><div><label>التاريخ</label><input type="date" name="date" value="${C.today()}"></div><div><label>ملاحظة</label><input name="note" maxlength="200" placeholder="كشف ${esc(C.today())}"></div></div>`, {
+    submit: 'تسجيل التسوية',
+    onChange: (form) => {
+      const raw = form.elements.statement.value.trim(); if (!raw) return;
+      const neg = raw.startsWith('-'), n = C.parseAmount(raw.replace(/^-/, '')); if (Number.isNaN(n)) return;
+      const diff = C.round((neg ? -n : n) - cur, a.currency);
+      $('rcH').innerHTML = diff === 0 ? 'الرصيد مطابق — لا حاجة لتسوية.' : `سيُسجل فرق ${money(diff, a.currency, { sign: true })} كحركة «تسوية رصيد»، ويصبح الرصيد ${money(neg ? -n : n, a.currency)}.`;
+    },
+    onSubmit: (v) => commit((d) => C.reconcileAccount(d, a.id, v), 'تمت التسوية', { label: `تسوية «${a.name}» مع الكشف` }),
+  });
+}
+// حذف حساب: بلا حركات = حذف مباشر. عليه حركات = أرشفة (موصى به) أو نقل كل حركاته إلى حساب آخر بنفس العملة.
+async function deleteAccountFlow(id) {
+  const a = acc(id); if (!a) return;
+  const u = C.accountUsage(S.data, id), n = u.transactions + u.transfers + u.recurring + u.payments;
+  if (!n) {
+    if (await confirmBox({ title: 'حذف الحساب؟', text: `«${a.name}» لا يحتوي أي حركات، وسيُحذف. يمكنك التراجع بعدها.`, ok: 'حذف', danger: true })) { await commit((d) => C.deleteAccount(d, id), 'تم حذف الحساب', { label: `حذف الحساب «${a.name}»` }); closeSheet(); }
+    return;
+  }
+  const targets = S.data.accounts.filter((x) => x.id !== id && x.currency === a.currency);
+  sheet(`حذف «${a.name}»`, `
+    <div class="notice">على هذا الحساب ${u.transactions} عملية و${u.transfers} تحويل${u.recurring ? ` و${u.recurring} بند متكرر` : ''}. لا يمكن حذفه مع ترك حركاته بلا حساب، لأن ذلك يفسد الأرصدة والتقارير.</div>
+    <h3>الخيار الآمن (موصى به)</h3><p class="muted" style="font-size:14px">${a.archived ? 'الحساب مؤرشف أصلًا: لا يظهر في الاختيارات ويبقى كشفه كاملًا.' : 'إغلاق الحساب: يختفي من قوائم الاختيار ويبقى كشفه ورصيده محفوظين، ويمكن إعادة فتحه. يمكنك بعدها إنشاء حساب جديد بنفس الاسم.'}</p>
+    ${a.archived ? '' : `<button type="button" class="btn primary block" data-action="archive-account" data-id="${esc(a.id)}">إغلاق/أرشفة الحساب</button>`}
+    <h3 style="margin-top:16px">نقل الحركات ثم الحذف</h3>
+    ${targets.length ? `<p class="muted" style="font-size:14px">تنتقل كل العمليات والتحويلات والدفعات والرصيد الافتتاحي إلى الحساب الذي تختاره (بنفس العملة ${esc(a.currency)})، ثم يُحذف هذا الحساب. مجموع الرصيدين لا يتغير.</p>
+      <form id="mergeF"><select name="target">${targets.map((t) => `<option value="${esc(t.id)}">${esc(t.name)}${t.archived ? ' (مؤرشف)' : ''} — ${plain(C.balance(S.data, t), t.currency)}</option>`).join('')}</select>
+      <div class="hint" id="mergeH"></div><button type="submit" class="btn ghost-danger block" style="margin-top:10px">نقل الحركات وحذف «${esc(a.name)}»</button></form>`
+      : `<p class="muted" style="font-size:14px">لا يوجد حساب آخر بعملة ${esc(a.currency)} لنقل الحركات إليه. أنشئ حسابًا جديدًا بنفس العملة أولًا إن أردت ذلك.</p>`}`);
+  const f = $('mergeF'); if (!f) return;
+  const hint = () => { const t = acc(f.elements.target.value); $('mergeH').innerHTML = `بعد النقل: رصيد «${esc(t.name)}» = ${money(C.balance(S.data, t) + C.balance(S.data, a), a.currency)}`; };
+  f.onchange = hint; hint();
+  f.onsubmit = async (e) => {
+    e.preventDefault(); const t = acc(f.elements.target.value);
+    if (!(await confirmBox({ title: 'نقل الحركات وحذف الحساب؟', text: `ستنتقل كل حركات «${a.name}» إلى «${t.name}» ويُحذف «${a.name}». يمكنك التراجع بعدها.`, ok: 'نقل وحذف', danger: true }))) return;
+    try { await commit((d) => C.deleteAccount(d, id, { mode: 'merge', targetId: t.id }), 'تم النقل والحذف', { label: `دمج «${a.name}» في «${t.name}»` }); closeSheet(); } catch (err) { toast(errText(err), true); }
+  };
 }
 function openTransfer() {
   const active = S.data.accounts.filter((a) => !a.archived);
@@ -488,11 +583,11 @@ function openTransferDetail(id) {
 function dueTag(due, rem) { if (!due || !(rem > 0)) return ''; const t = C.today(); return due < t ? '<span class="tag bad">متأخر</span>' : due <= C.dateStr(new Date(Date.now() + 7 * 864e5)) ? '<span class="tag warn">قريب</span>' : ''; }
 function projectRow(p) {
   const rem = C.remainingOf(p), pct = p.amount ? Math.min(100, (C.paidOf(p) / p.amount) * 100) : 0;
-  return `<li><button class="item" data-action="open-project" data-id="${esc(p.id)}"><span class="ico">${icon('i-users')}</span><div class="body"><div class="title">${esc(p.client)} — ${esc(p.name)} ${dueTag(p.due, rem)}${rem <= 0 ? ' <span class="tag">مكتمل</span>' : ''}</div>
+  return `<li><button class="item" data-action="open-project" data-id="${esc(p.id)}"><span class="ico">${icon('i-users')}</span><div class="body"><div class="title">${esc(p.client)} — ${esc(p.name)} ${dueTag(p.due, rem)}${p.archived ? ' <span class="tag">مؤرشف</span>' : rem <= 0 ? ' <span class="tag">مكتمل</span>' : ''}</div>
     <div class="progress good"><span style="width:${pct}%"></span></div><div class="sub">المستلم ${plain(C.paidOf(p), p.currency)} من ${plain(p.amount, p.currency)}${p.due ? ' · التحصيل ' + esc(p.due) : ''}</div></div><div class="amt">${money(rem, p.currency)}<small>متبقٍ</small></div></button></li>`;
 }
 function renderClients() {
-  const ps = [...S.data.projects].sort((a, b) => (C.remainingOf(b) > 0) - (C.remainingOf(a) > 0) || String(a.due || '9').localeCompare(String(b.due || '9')));
+  const ps = [...S.data.projects].sort((a, b) => (!!a.archived - !!b.archived) || (C.remainingOf(b) > 0) - (C.remainingOf(a) > 0) || String(a.due || '9').localeCompare(String(b.due || '9')));
   const recv = C.obligationTotals({ ...S.data, obligations: [] }, S.rates).receivable;
   $('v-clients').innerHTML = `${head('العملاء والمشاريع')}
     <div class="card"><small>مستحقات العملاء المتبقية</small><div style="font-size:26px;font-weight:700">${money(recv.total, disp())}</div>${missingNote(recv.missing)}</div>
@@ -526,7 +621,7 @@ function openProjectForm(id) {
 }
 function paymentsList(item, kind) {
   if (!item.payments.length) return '<div class="empty">لا توجد دفعات بعد</div>';
-  return `<ul class="list">${[...item.payments].reverse().map((p) => `<li class="item"><div class="body"><div class="title">${money(p.amount, item.currency)}${p.received && acc(p.accountId)?.currency !== item.currency ? ` <small>(${plain(p.received, acc(p.accountId)?.currency)})</small>` : ''}</div><div class="sub">${p.legacy ? 'مسجلة في نسخة سابقة دون حساب' : `${esc(p.date)} · ${esc(acc(p.accountId)?.name || '—')}`}</div></div>${p.legacy ? '' : `<button class="btn small ghost-danger" data-action="del-payment" data-kind="${kind}" data-id="${esc(item.id)}" data-pid="${esc(p.id)}">حذف</button>`}</li>`).join('')}</ul>`;
+  return `<ul class="list">${[...item.payments].reverse().map((p) => `<li class="item"><div class="body"><div class="title">${money(p.amount, item.currency)}${p.received && acc(p.accountId)?.currency !== item.currency ? ` <small>(${plain(p.received, acc(p.accountId)?.currency)})</small>` : ''}</div><div class="sub">${p.legacy ? 'مسجلة في نسخة سابقة دون حساب' : `${esc(p.date)} · ${esc(acc(p.accountId)?.name || '—')}`}</div></div>${p.legacy || item.archived ? '' : `<div class="actions" style="margin:0;flex-wrap:nowrap"><button class="btn small" data-action="edit-payment" data-kind="${kind}" data-id="${esc(item.id)}" data-pid="${esc(p.id)}">تعديل</button><button class="btn small ghost-danger" data-action="del-payment" data-kind="${kind}" data-id="${esc(item.id)}" data-pid="${esc(p.id)}">إلغاء</button></div>`}</li>`).join('')}</ul>`;
 }
 const phoneLinks = (phone) => { const n = String(phone || '').replace(/[^\d+]/g, ''); if (n.replace(/\D/g, '').length < 6) return ''; return `<a class="btn small" href="tel:${esc(n)}">اتصال</a><a class="btn small" href="https://wa.me/${esc(n.replace(/^\+/, '').replace(/^00/, ''))}" target="_blank" rel="noopener noreferrer">واتساب</a>`; };
 function openProject(id) {
@@ -535,44 +630,83 @@ function openProject(id) {
   sheet(`${p.client} — ${p.name}`, `
     <div class="kpis"><div><small>الاتفاق</small><b>${money(p.amount, p.currency)}</b></div><div><small>المستلم</small><b class="good">${money(C.paidOf(p), p.currency)}</b></div><div><small>المتبقي</small><b>${money(rem, p.currency)}</b></div></div>
     <p class="muted">${p.phone ? `<span dir="ltr">${esc(p.phone)}</span> · ` : ''}${p.due ? 'موعد التحصيل ' + esc(p.due) + ' ' + dueTag(p.due, rem) : 'بدون موعد'}${p.note ? '<br>' + esc(p.note) : ''}</p>
-    <div class="actions">${rem > 0 ? `<button class="btn primary" data-action="pay" data-kind="project" data-id="${esc(p.id)}">تسجيل دفعة</button>` : ''}${phoneLinks(p.phone)}<button class="btn" data-action="edit-project" data-id="${esc(p.id)}">تعديل</button></div>
+    ${p.archived ? '<div class="notice info">هذا المشروع مؤرشف: دفعاته وحركاته محفوظة كما هي ولا يمكن تعديلها حتى تلغي الأرشفة.</div>' : ''}
+    <div class="actions">${rem > 0 && !p.archived ? `<button class="btn primary" data-action="pay" data-kind="project" data-id="${esc(p.id)}">تسجيل دفعة</button>` : ''}${phoneLinks(p.phone)}${p.archived ? '' : `<button class="btn" data-action="edit-project" data-id="${esc(p.id)}">تعديل</button>`}</div>
     <h3 style="margin-top:16px">سجل الدفعات</h3>${paymentsList(p, 'project')}
-    <div class="actions"><button class="btn small ghost-danger" data-action="del-item" data-kind="project" data-id="${esc(p.id)}">حذف المشروع</button></div>`);
+    <div class="actions">${rem <= 0 ? `<button class="btn small" data-action="archive-item" data-kind="project" data-id="${esc(p.id)}">${p.archived ? 'إلغاء الأرشفة' : 'أرشفة'}</button>` : ''}<button class="btn small ghost-danger" data-action="del-item" data-kind="project" data-id="${esc(p.id)}">حذف المشروع…</button></div>`);
 }
-function openPayment(kind, id) {
+function openPayment(kind, id, pid) {
   const item = (kind === 'project' ? S.data.projects : S.data.obligations).find((x) => x.id === id); if (!item) return;
-  const rem = C.remainingOf(item), active = S.data.accounts.filter((a) => !a.archived);
-  const same = active.find((a) => a.currency === item.currency) || active[0];
+  const pay = pid ? item.payments.find((x) => x.id === pid) : null; if (pid && !pay) return;
+  const rem = C.remainingOf(item) + (pay ? pay.amount : 0), active = S.data.accounts.filter((a) => !a.archived || a.id === pay?.accountId);
+  const same = pay ? acc(pay.accountId) : active.find((a) => a.currency === item.currency) || active[0];
   const isIn = kind === 'project' || item.type === 'receivable';
-  sheet(isIn ? 'تسجيل دفعة مستلمة' : 'تسجيل سداد', `
-    <p class="muted">المتبقي: ${money(rem, item.currency)}</p>
-    <label for="payA">قيمة الدفعة (${esc(item.currency)})</label><input id="payA" name="amount" class="amount-input" inputmode="decimal" value="${esc(rem)}" required>
-    <label>${isIn ? 'الحساب الذي استقبل المبلغ' : 'الحساب الذي دُفع منه'}</label><select name="accountId">${accountOptions(same?.id)}</select>
-    <div id="payFx" hidden><label id="payFxL"></label><input name="received" inputmode="decimal"><div class="hint" id="payFxH"></div></div>
-    <label>التاريخ</label><input type="date" name="date" value="${C.today()}">
-    <div class="hint">${kind === 'obligation' && !item.countInReports ? 'لن تُحتسب هذه الدفعة دخلًا أو مصروفًا لأن مبلغ الدين سُجّل كحركة على حساب عند إنشائه.' : isIn ? 'ستُسجل كدخل (تحصيل مستحقات) مرة واحدة فقط.' : 'ستُسجل كمصروف (سداد ديون).'}</div>`, {
-    submit: 'حفظ الدفعة',
+  const counts = kind === 'project' || C.originCounts(item);
+  sheet(pay ? 'تعديل الدفعة' : isIn ? 'تسجيل دفعة مستلمة' : 'تسجيل سداد', `
+    <p class="muted">${pay ? 'المتاح لهذه الدفعة' : 'المتبقي'}: ${money(rem, item.currency)}</p>
+    <label for="payA">قيمة الدفعة (${esc(item.currency)})</label><input id="payA" name="amount" class="amount-input" inputmode="decimal" value="${esc(pay ? pay.amount : C.remainingOf(item))}" required>
+    <label>${isIn ? 'الحساب الذي استقبل المبلغ' : 'الحساب الذي دُفع منه'}</label><select name="accountId">${S.data.accounts.filter((a) => active.includes(a)).map((a) => `<option value="${esc(a.id)}"${a.id === same?.id ? ' selected' : ''}>${esc(a.name)} — ${a.currency} (${plain(C.balance(S.data, a), a.currency)})</option>`).join('')}</select>
+    <div id="payFx" hidden><label id="payFxL"></label><input name="received" inputmode="decimal" value="${esc(pay && pay.received !== pay.amount ? pay.received : '')}"><div class="hint" id="payFxH"></div></div>
+    <label>التاريخ</label><input type="date" name="date" value="${esc(pay?.date || C.today())}">
+    <div class="hint">${!counts ? `${isIn ? 'سيزيد' : 'سينقص'} رصيد الحساب فقط — لن تُحتسب دخلًا أو مصروفًا (حسب أصل الدين).` : isIn ? 'ستُسجل كدخل (تحصيل مستحقات) مرة واحدة فقط.' : 'ستُسجل كمصروف (سداد ديون) مرة واحدة فقط.'}${pay ? ' تعديل الدفعة يعدّل حركتها في الحساب معًا.' : ''}</div>`, {
+    submit: pay ? 'حفظ التعديل' : 'حفظ الدفعة',
+    onReady: (b, form) => { if (pay) form.dataset.acc = pay.accountId; },
     onChange: (form) => {
       const a = acc(form.elements.accountId.value), diff = a && a.currency !== item.currency; $('payFx').hidden = !diff;
       if (diff) { $('payFxL').textContent = `المبلغ ${isIn ? 'المستلم' : 'المدفوع'} فعليًا بـ ${a.currency}`; const n = C.parseAmount(form.elements.amount.value), r = C.convert(1, item.currency, a.currency, S.rates); if (form.dataset.acc !== a.id) { form.elements.received.value = r && n > 0 ? C.round(n * r, a.currency) : ''; form.dataset.acc = a.id; } $('payFxH').textContent = r ? `بالسعر الحالي ≈ ${plain(n * r, a.currency)}` : 'لا يوجد سعر محفوظ؛ اكتب المبلغ الفعلي.'; }
     },
-    onSubmit: async (v) => { await commit((d) => C.addPayment(d, kind, id, v), 'تم تسجيل الدفعة'); kind === 'project' ? openProject(id) : openOb(id); return false; },
+    onSubmit: async (v) => {
+      const who = kind === 'project' ? `${item.client}` : item.party;
+      if (pay) await commit((d) => C.updatePayment(d, kind, id, pid, v), 'تم تعديل الدفعة', { label: `تعديل دفعة «${who}»` });
+      else {
+        const dup = C.findDuplicatePayment(S.data, kind, id, v);
+        if (dup && !(await confirmBox({ title: 'دفعة مكررة؟', text: `سُجلت قبل لحظات دفعة بنفس المبلغ (${plain(dup.amount, item.currency)}) من نفس الحساب وبنفس التاريخ. هل تريد تسجيلها مرة ثانية فعلًا؟`, ok: 'نعم، دفعة ثانية', cancel: 'لا' }))) return false;
+        await commit((d) => C.addPayment(d, kind, id, v), 'تم تسجيل الدفعة', { label: `${isIn ? 'تحصيل' : 'سداد'} ${plain(C.parseAmount(v.amount), item.currency)} — «${who}»` });
+      }
+      kind === 'project' ? openProject(id) : openOb(id); return false;
+    },
   });
+}
+// حذف مشروع/دين: لا تُحذف الحركات ولا تتغير الأرصدة دون اختيار صريح
+async function deleteItemFlow(kind, id) {
+  const item = (kind === 'project' ? S.data.projects : S.data.obligations).find((x) => x.id === id); if (!item) return;
+  const name = kind === 'project' ? `${item.client} — ${item.name}` : item.party, eff = C.itemDeleteEffects(S.data, kind, id);
+  if (!eff.linked) {
+    if (await confirmBox({ title: 'حذف السجل؟', text: `«${name}» ليس له أي حركات على حساباتك، وحذفه لا يغيّر أي رصيد. يمكنك التراجع بعدها.`, ok: 'حذف', danger: true })) { await commit((d) => C.deleteItem(d, kind, id), 'تم الحذف', { label: `حذف «${name}»` }); closeSheet(); }
+    return;
+  }
+  const settled = C.remainingOf(item) <= 0;
+  const rev = eff.reverse.map((r) => { const a = acc(r.accountId); return a ? `«${esc(a.name)}»: ${money(C.balance(S.data, a), a.currency)} ← ${money(C.balance(S.data, a) + r.delta, a.currency)}` : ''; }).filter(Boolean).join('<br>');
+  sheet(`حذف «${name}»`, `
+    <div class="notice">لهذا السجل ${eff.linked} ${eff.linked === 1 ? 'حركة' : 'حركات'} على حساباتك (دفعات${item.initialTxId ? ' والمبلغ الأولي' : ''}). اختر ماذا يحدث لها:</div>
+    ${settled ? `<button type="button" class="btn primary block" data-action="archive-item" data-kind="${kind}" data-id="${esc(id)}">أرشفة بدل الحذف (موصى به)</button><p class="hint">يختفي من القائمة النشطة، وتبقى الحركات والأرصدة كما هي، ويمكن الرجوع إليه.</p>` : ''}
+    <button type="button" class="btn block" id="delKeep" style="margin-top:10px">حذف السجل فقط — إبقاء الحركات والأرصدة كما هي</button>
+    <p class="hint">تبقى الحركات في سجل العمليات كحركات عادية مع ملاحظة «${kind === 'project' ? 'مشروع' : 'دين'} محذوف». لا يتغير أي رصيد.</p>
+    <button type="button" class="btn ghost-danger block" id="delRev" style="margin-top:10px">حذف السجل وحركاته وعكس أثرها</button>
+    <p class="hint">استخدمه فقط إن كانت الدفعات سُجلت بالخطأ ولم تحدث فعلًا. الأرصدة ستتغير:<br>${rev}</p>`);
+  $('delKeep').onclick = async () => { await commit((d) => C.deleteItem(d, kind, id, { mode: 'keep' }), 'تم حذف السجل وبقيت الحركات', { label: `حذف «${name}» (مع إبقاء الحركات)` }); closeSheet(); };
+  $('delRev').onclick = async () => {
+    if (!(await confirmBox({ title: 'عكس أثر الدفعات؟', text: 'ستُحذف الحركات المرتبطة وتعود الأرصدة كما كانت قبلها، وتختفي من التقارير. هل هذه الدفعات لم تحدث فعلًا؟', ok: 'حذف وعكس', danger: true }))) return;
+    await commit((d) => C.deleteItem(d, kind, id, { mode: 'reverse' }), 'تم الحذف وعكس الحركات', { label: `حذف «${name}» مع حركاته` }); closeSheet();
+  };
 }
 
 // ---------- الديون ----------
 function obRow(o) {
   const rem = C.remainingOf(o), pct = o.amount ? Math.min(100, (C.paidOf(o) / o.amount) * 100) : 0;
-  return `<li><button class="item" data-action="open-ob" data-id="${esc(o.id)}"><span class="ico ${o.type === 'debt' ? 'out' : 'in'}">${icon('i-hand')}</span><div class="body"><div class="title">${esc(o.party)} ${dueTag(o.due, rem)}${rem <= 0 ? ' <span class="tag">مسدد</span>' : ''}</div><div class="progress ${o.type === 'debt' ? '' : 'good'}"><span style="width:${pct}%"></span></div><div class="sub">${o.type === 'debt' ? 'سددت' : 'استلمت'} ${plain(C.paidOf(o), o.currency)} من ${plain(o.amount, o.currency)}${o.due ? ' · ' + esc(o.due) : ''}</div></div><div class="amt">${money(rem, o.currency)}</div></button></li>`;
+  return `<li><button class="item" data-action="open-ob" data-id="${esc(o.id)}"><span class="ico ${o.type === 'debt' ? 'out' : 'in'}">${icon('i-hand')}</span><div class="body"><div class="title">${esc(o.party)} ${dueTag(o.due, rem)}${C.obligationStatus(o) !== 'active' ? ` <span class="tag">${C.STATUS_LABELS[C.obligationStatus(o)]}</span>` : ''}</div><div class="progress ${o.type === 'debt' ? '' : 'good'}"><span style="width:${pct}%"></span></div><div class="sub">${o.type === 'debt' ? 'سددت' : 'استلمت'} ${plain(C.paidOf(o), o.currency)} من ${plain(o.amount, o.currency)}${o.due ? ' · ' + esc(o.due) : ''}</div></div><div class="amt">${money(rem, o.currency)}</div></button></li>`;
 }
 function renderDebts() {
-  const tab = S.debtTab, list = S.data.obligations.filter((o) => o.type === tab).sort((a, b) => (C.remainingOf(b) > 0) - (C.remainingOf(a) > 0) || String(a.due || '9').localeCompare(String(b.due || '9')));
+  const tab = S.debtTab, st = S.debtStatus, mine = S.data.obligations.filter((o) => o.type === tab);
+  const cnt = (k) => mine.filter((o) => C.obligationStatus(o) === k).length;
+  const list = mine.filter((o) => C.obligationStatus(o) === st).sort((a, b) => (C.remainingOf(b) > 0) - (C.remainingOf(a) > 0) || String(a.due || '9').localeCompare(String(b.due || '9')));
   const t = C.obligationTotals({ ...S.data, projects: [] }, S.rates)[tab];
   $('v-debts').innerHTML = `${head('الديون')}
     <div class="seg" style="margin:8px 0"><button data-debt-tab="receivable" aria-pressed="${tab === 'receivable'}">ديون لي</button><button data-debt-tab="debt" aria-pressed="${tab === 'debt'}">ديون عليّ</button></div>
     <div class="card"><small>المتبقي ${tab === 'debt' ? 'عليّ' : 'لي'}</small><div style="font-size:26px;font-weight:700">${money(t.total, disp())}</div>${missingNote(t.missing)}</div>
     <button class="btn primary block" data-action="add-ob" data-type="${tab}">${tab === 'debt' ? 'إضافة دين عليّ' : 'إضافة دين لي'}</button>
-    <div class="card">${list.length ? `<ul class="list">${list.map(obRow).join('')}</ul>` : '<div class="empty">لا يوجد</div>'}</div>`;
+    <div class="seg" style="margin:12px 0 0">${['active', 'settled', 'archived'].map((k) => `<button data-debt-status="${k}" aria-pressed="${st === k}">${C.STATUS_LABELS[k]} (${cnt(k)})</button>`).join('')}</div>
+    <div class="card">${list.length ? `<ul class="list">${list.map(obRow).join('')}</ul>` : `<div class="empty">${st === 'active' ? 'لا توجد ديون نشطة' : st === 'settled' ? 'لا توجد ديون مسددة غير مؤرشفة' : 'لا يوجد أرشيف'}</div>`}</div>`;
 }
 function openObForm(type = 'receivable', id) {
   const o = id ? S.data.obligations.find((x) => x.id === id) : null;
@@ -581,30 +715,46 @@ function openObForm(type = 'receivable', id) {
     <label for="op">اسم الشخص أو الجهة</label><input id="op" name="party" required maxlength="100" value="${esc(o?.party || '')}">
     <div class="grid2" style="grid-template-columns:2fr 1fr"><div><label for="oa">المبلغ الكامل</label><input id="oa" name="amount" inputmode="decimal" required value="${esc(o?.amount || '')}"></div><div><label>العملة</label><select name="currency" ${o ? 'disabled' : ''}>${currencyOptions(o?.currency || disp())}</select></div></div>
     <div class="grid2"><div><label>رقم التواصل</label><input name="phone" type="tel" dir="ltr" maxlength="35" value="${esc(o?.phone || '')}"></div><div><label>تاريخ الاستحقاق</label><input type="date" name="due" value="${esc(o?.due || '')}"></div></div>
-    ${o ? '' : `<label id="omL">هل خرج المبلغ من أحد حساباتك؟</label><select name="movementAccountId"><option value="">لا — بدون حركة على حساباتي</option>${accountOptions(null)}</select>
-      <div class="hint" id="omH"></div><div id="omFx" hidden><label id="omFxL"></label><input name="movementRate" inputmode="decimal"></div>`}
+    ${o ? `<p class="hint">أصل الدين: ${esc(C.DEBT_ORIGINS[o.type][o.origin] || 'من إصدار سابق')}. لا يمكن تغييره بعد الإنشاء لأنه يحدد أثر الدفعات المسجلة.</p>`
+      : `<label>ما أصل هذا الدين؟</label><input type="hidden" name="origin" value=""><div class="origin-list" id="omOrig"></div>
+      <div class="hint" id="omH">اختر أحد الخيارات — يحدد هل يتغير رصيد حساباتك الآن، وهل يُحتسب السداد مصروفًا/دخلًا.</div>
+      <div id="omAcc" hidden><label id="omL"></label><select name="movementAccountId">${accountOptions(null)}</select>
+      <div class="grid2"><div><label>تاريخ الحركة</label><input type="date" name="date" value="${C.today()}"></div><div id="omFx" hidden><label id="omFxL"></label><input name="movementRate" inputmode="decimal"></div></div></div>`}
     <label>ملاحظة</label><input name="note" maxlength="300" value="${esc(o?.note || '')}">`, {
     onReady: (b, form) => !o && setPick(form, 'type', type),
     onChange: (form) => {
       if (o) return;
-      const ty = form.elements.type.value, a = acc(form.elements.movementAccountId.value);
-      $('omL').textContent = ty === 'debt' ? 'هل استلمت المبلغ في أحد حساباتك؟ (قرض)' : 'هل خرج المبلغ من أحد حساباتك؟ (سلفة)';
-      $('omH').textContent = a ? (ty === 'debt' ? 'سيزيد رصيد الحساب الآن، والسداد لاحقًا ينقصه — دون احتساب دخل أو مصروف.' : 'سينقص رصيد الحساب الآن، والتحصيل لاحقًا يعيده — دون احتساب دخل أو مصروف.') : (ty === 'debt' ? 'مثل شراء بالآجل: السداد لاحقًا يُحتسب مصروفًا.' : 'مثل عمل لم تُدفع قيمته: التحصيل لاحقًا يُحتسب دخلًا.');
+      const ty = form.elements.type.value;
+      if (form.dataset.ty !== ty) { form.dataset.ty = ty; form.elements.origin.value = ''; $('omOrig').innerHTML = Object.entries(C.DEBT_ORIGINS[ty]).map(([k, l]) => pick('origin', k, esc(l), 'origin-opt')).join(''); }
+      const org = form.elements.origin.value, moves = org === 'received' || org === 'lent';
+      $('omAcc').hidden = !moves;
+      const H = { received: 'سيزيد رصيد الحساب الذي تختاره الآن بمبلغ القرض، والسداد لاحقًا ينقصه — دون احتساب دخل أو مصروف.', credit: 'لا يتغير أي رصيد الآن. عند السداد ينقص رصيد الحساب ويُحتسب مصروفًا مرة واحدة.', old: ty === 'debt' ? 'لا يتغير أي رصيد الآن. عند السداد ينقص رصيد الحساب فقط — لا يُحتسب مصروفًا (صُرف المال قبل فلوسي).' : 'لا يتغير أي رصيد الآن. عند التحصيل يزيد رصيد الحساب فقط — لا يُحتسب دخلًا.',
+        lent: 'سينقص رصيد الحساب الذي تختاره الآن، والتحصيل لاحقًا يعيده — دون احتساب دخل أو مصروف.', earned: 'لا يتغير أي رصيد الآن. عند التحصيل يزيد رصيد الحساب ويُحتسب دخلًا مرة واحدة.' };
+      $('omH').textContent = H[org] || 'اختر أحد الخيارات — يحدد هل يتغير رصيد حساباتك الآن، وهل يُحتسب السداد مصروفًا/دخلًا.';
+      $('omL').textContent = ty === 'debt' ? 'الحساب الذي استلمت فيه المبلغ' : 'الحساب الذي خرج منه المبلغ';
+      const a = moves ? acc(form.elements.movementAccountId.value) : null;
       const diff = a && a.currency !== form.elements.currency.value; $('omFx').hidden = !diff;
       if (diff) { $('omFxL').textContent = `سعر التحويل: 1 ${form.elements.currency.value} = ؟ ${a.currency}`; if (form.dataset.p !== a.id) { form.elements.movementRate.value = rateHint(form.elements.currency.value, a.currency).rate; form.dataset.p = a.id; } }
     },
-    onSubmit: (v) => commit((d) => (o ? C.updateObligation(d, o.id, v) : C.addObligation(d, { ...v, movementRate: C.parseAmount(v.movementRate) })), 'تم الحفظ'),
+    onSubmit: (v) => {
+      if (o) return commit((d) => C.updateObligation(d, o.id, v), 'تم الحفظ', { label: `تعديل دين «${o.party}»` });
+      if (!v.origin) throw new C.ValidationError('اختر أصل الدين أولًا');
+      const moves = v.origin === 'received' || v.origin === 'lent';
+      return commit((d) => C.addObligation(d, { ...v, movementAccountId: moves ? v.movementAccountId : '', movementRate: C.parseAmount(v.movementRate) }), 'تم الحفظ', { label: `إضافة دين «${v.party}»` });
+    },
   });
 }
 function openOb(id) {
   const o = S.data.obligations.find((x) => x.id === id); if (!o) return;
-  const rem = C.remainingOf(o);
+  const rem = C.remainingOf(o), st = C.obligationStatus(o);
   sheet(`${o.party} · ${o.type === 'debt' ? 'دين عليّ' : 'دين لي'}`, `
+    <p style="margin:0 0 8px"><span class="tag">${C.STATUS_LABELS[st]}</span> <small>${esc(C.DEBT_ORIGINS[o.type][o.origin] || 'أُنشئ في إصدار سابق')}</small></p>
     <div class="kpis"><div><small>المبلغ</small><b>${money(o.amount, o.currency)}</b></div><div><small>${o.type === 'debt' ? 'المسدد' : 'المحصل'}</small><b class="good">${money(C.paidOf(o), o.currency)}</b></div><div><small>المتبقي</small><b>${money(rem, o.currency)}</b></div></div>
     <p class="muted">${o.phone ? `<span dir="ltr">${esc(o.phone)}</span> · ` : ''}${o.due ? 'الاستحقاق ' + esc(o.due) + ' ' + dueTag(o.due, rem) : 'بدون موعد'}${o.note ? '<br>' + esc(o.note) : ''}</p>
-    <div class="actions">${rem > 0 ? `<button class="btn primary" data-action="pay" data-kind="obligation" data-id="${esc(o.id)}">${o.type === 'debt' ? 'تسجيل سداد' : 'تسجيل تحصيل'}</button>` : ''}${phoneLinks(o.phone)}<button class="btn" data-action="edit-ob" data-id="${esc(o.id)}">تعديل</button></div>
+    ${o.archived ? '<div class="notice info">هذا الدين مؤرشف: دفعاته وحركاته محفوظة كما هي ولا يمكن تعديلها حتى تلغي الأرشفة.</div>' : ''}
+    <div class="actions">${rem > 0 && !o.archived ? `<button class="btn primary" data-action="pay" data-kind="obligation" data-id="${esc(o.id)}">${o.type === 'debt' ? 'تسجيل سداد' : 'تسجيل تحصيل'}</button>` : ''}${phoneLinks(o.phone)}${o.archived ? '' : `<button class="btn" data-action="edit-ob" data-id="${esc(o.id)}">تعديل</button>`}</div>
     <h3 style="margin-top:16px">الدفعات</h3>${paymentsList(o, 'obligation')}
-    <div class="actions"><button class="btn small ghost-danger" data-action="del-item" data-kind="obligation" data-id="${esc(o.id)}">حذف</button></div>`);
+    <div class="actions">${st !== 'active' ? `<button class="btn small" data-action="archive-item" data-kind="obligation" data-id="${esc(o.id)}">${o.archived ? 'إلغاء الأرشفة' : 'أرشفة'}</button>` : ''}<button class="btn small ghost-danger" data-action="del-item" data-kind="obligation" data-id="${esc(o.id)}">حذف…</button></div>`);
 }
 
 // ---------- الادخار ----------
@@ -825,6 +975,9 @@ function renderSettings() {
       : `<p class="muted">القفل غير مفعّل. عند التفعيل تُشفَّر بياناتك على الجهاز ولا تُفتح إلا برمزك${S.passkeyOK ? ' أو بـ Face ID' : ''}.</p><button class="btn primary" data-action="lock-on">تفعيل القفل والتشفير</button>`}
       <details style="margin-top:10px"><summary class="muted" style="font-size:14px">ما الفرق بين القفل والتشفير؟</summary><p class="muted" style="font-size:14px;line-height:1.8">شاشة القفل وحدها (التحقق من هويتك) تمنع من يمسك جوالك المفتوح من رؤية الأرقام، لكنها لا تحمي الملفات نفسها. التشفير يحوّل البيانات المحفوظة إلى نص غير مقروء بدون المفتاح. في فلوسي يُشتق المفتاح من رمزك عبر PBKDF2 (600 ألف تكرار) أو من Face ID عبر مفتاح مرور (Passkey/PRF)، ولا يُحفظ الرمز نفسه.<br>• الرمز من 6 أرقام يحمي من المتطفل العادي، لكن من ينسخ ملفات المتصفح بأدوات متخصصة قد يجربه حاسوبيًا؛ كلمة مرور طويلة أقوى بكثير.<br>• نسيت الرمز؟ استخدم مفتاح الاسترداد. بدونه ودون نسخة احتياطية لا يمكن استعادة البيانات — لا أحد يملك مفتاحًا خلفيًا.</p></details></div>
 
+    <div class="card"><h3>فحص سلامة الأرصدة</h3><p class="muted" style="font-size:14px">يفحص الحسابات والديون والدفعات بحثًا عن أخطاء قد تجعل الرصيد غير صحيح (سداد مكرر، حركات يتيمة، أرصدة سالبة…). الفحص للقراءة فقط ولا يغيّر شيئًا؛ أي إصلاح يتم بضغطة منك ويمكن التراجع عنه.</p>
+      <div class="actions"><button class="btn small primary" data-action="diagnostics">تشغيل الفحص</button>${S.hasUpgradeBackup ? '<button class="btn small" data-action="restore-upgrade-backup">استعادة نسخة ما قبل 3.1</button>' : ''}</div></div>
+
     <div class="card"><h3>النسخ الاحتياطي</h3>
       <p class="muted" style="font-size:14px">بياناتك محفوظة تلقائيًا على هذا الجهاز، لكن التخزين المحلي وحده لا يضمن عدم الفقد (ضياع الجوال، حذف التطبيق، مسح بيانات Safari). احتفظ بنسخة خارجية.</p>
       <div class="actions"><button class="btn primary small" data-action="export-enc">نسخة مشفرة (موصى به)</button><button class="btn small" data-action="export-json">نسخة JSON غير مشفرة</button><button class="btn small" data-action="export-csv">تصدير CSV</button></div>
@@ -850,9 +1003,9 @@ function renderSettings() {
     <div class="card" style="border-color:var(--bad)"><h3 class="bad">حذف جميع بياناتي</h3><p class="muted" style="font-size:14px">يحذف كل البيانات المالية من هذا الجهاز. لا يحذف النسخ الموجودة على Google Drive أو الملفات التي نزّلتها.</p><button class="btn danger" data-action="wipe">حذف جميع بياناتي</button></div>`;
   $('themeSel').value = theme;
   $('themeSel').onchange = (e) => applyTheme(e.target.value);
-  $('curSel').onchange = (e) => commit((dd) => { dd.settings.displayCurrency = e.target.value; }, 'تم تغيير عملة العرض');
-  $('lockGrace') && ($('lockGrace').onchange = (e) => commit((dd) => { dd.settings.lockGrace = Number(e.target.value); }, 'تم'));
-  $('autoLock') && ($('autoLock').onchange = (e) => commit((dd) => { dd.settings.autoLock = Number(e.target.value); }, 'تم'));
+  $('curSel').onchange = (e) => commit((dd) => { dd.settings.displayCurrency = e.target.value; }, 'تم تغيير عملة العرض', { history: false });
+  $('lockGrace') && ($('lockGrace').onchange = (e) => commit((dd) => { dd.settings.lockGrace = Number(e.target.value); }, 'تم', { history: false }));
+  $('autoLock') && ($('autoLock').onchange = (e) => commit((dd) => { dd.settings.autoLock = Number(e.target.value); }, 'تم', { history: false }));
   $('importFile').onchange = (e) => { const f = e.target.files[0]; e.target.value = ''; if (f) importFile(f); };
   $('driveAuto') && ($('driveAuto').onchange = (e) => { S.drive.auto = e.target.checked; saveDriveSettings(); toast(e.target.checked ? 'تم تفعيل النسخ التلقائي' : 'تم إيقاف النسخ التلقائي'); if (e.target.checked) scheduleDrive(true); });
   if (Drive.configured()) Drive.loadGis().catch(() => {});
@@ -961,6 +1114,7 @@ async function restoreObject(obj, source, cachedKey) {
   const snap = S.session ? { vault: await Sec.sealVault(S.session, S.data) } : { data: S.data };
   await Store.setMeta('pre-restore', { at: new Date().toISOString(), ...snap }); S.hasPreRestore = true;
   S.data = up; S.data.updatedAt = new Date().toISOString();
+  await resetHistory(); // سجل التراجع يخص البيانات السابقة
   if (await save()) scheduleDrive(); closeSheet(); render(); toast('تمت الاستعادة بنجاح');
 }
 async function undoRestore() {
@@ -969,7 +1123,44 @@ async function undoRestore() {
   let data = m.data;
   if (m.vault) { try { data = await Sec.openWithSession(m.vault, S.session); } catch { return toast('تعذر فتح النسخة السابقة', true); } }
   if (!data) return;
-  S.data = C.upgrade(data); S.data.updatedAt = new Date().toISOString(); await save(); await Store.setMeta('pre-restore', null); S.hasPreRestore = false; render(); toast('تم التراجع');
+  S.data = C.upgrade(data); S.data.updatedAt = new Date().toISOString(); await resetHistory(); await save(); await Store.setMeta('pre-restore', null); S.hasPreRestore = false; render(); toast('تم التراجع');
+}
+// ---------- فحص سلامة الأرصدة (قراءة فقط) ----------
+const SEV = { error: ['bad', 'خطأ مؤكد'], warn: ['warn', 'يحتاج مراجعة'], info: ['', 'للعلم'] };
+const FIX_LABEL = { unlink: 'إلغاء الربط (الحركة تبقى)', 'delete-tx': 'حذف هذه الحركة', 'drop-payment': 'حذف الدفعة الفارغة', 'recalc-paid': 'تحديث القيمة', reconcile: 'تسوية مع الكشف', 'review-initial': 'لم يحدث — احذف الحركة' };
+function openDiagnostics() {
+  const f = C.diagnose(S.data); S.diagFindings = f;
+  const order = { error: 0, warn: 1, info: 2 };
+  const rows = [...f].sort((a, b) => order[a.severity] - order[b.severity]).map((x) => `<li class="item" style="align-items:flex-start"><div class="body"><div class="title">${esc(x.title)} <span class="tag ${SEV[x.severity][0]}">${SEV[x.severity][1]}</span></div><div class="sub" style="white-space:normal;line-height:1.7">${esc(x.detail)}</div>
+    ${x.fix ? `<div class="actions" style="margin-top:6px"><button class="btn small" data-action="apply-fix" data-fid="${esc(x.id)}">${FIX_LABEL[x.fix.type] || 'إصلاح'}</button></div>` : ''}</div></li>`).join('');
+  const n = f.filter((x) => x.severity !== 'info').length;
+  sheet('فحص سلامة الأرصدة', `
+    <div class="notice ${n ? '' : 'info'}">${f.length ? `وُجدت ${f.length} ملاحظة (${n} تحتاج انتباهك). <b>لم يُغيَّر أي شيء.</b> كل إصلاح يحتاج ضغطة منك وتأكيدًا، ويمكن التراجع عنه بزر التراجع.` : 'لم تُكتشف أي مشكلة في الحسابات والديون والدفعات.'}</div>
+    ${f.length ? `<ul class="list">${rows}</ul>` : ''}
+    <p class="hint">لا يمكن للفحص معرفة الحركات المحذوفة سابقًا (مثل دفعات حُذفت مع دين في إصدار قديم). إن كان رصيد حساب لا يطابق كشف البنك فاستخدم «تسوية مع كشف البنك» من صفحة الحساب.</p>
+    <div class="actions"><button class="btn small" id="diagCopy">نسخ التقرير</button></div>`);
+  $('diagCopy').onclick = () => { const t = f.map((x) => `[${SEV[x.severity][1]}] ${x.title}: ${x.detail}`).join('\n') || 'لا توجد مشاكل'; navigator.clipboard?.writeText(`فحص فلوسي ${C.APP_VERSION} — ${C.today()}\n${t}`).then(() => toast('تم نسخ التقرير'), () => toast('تعذر النسخ', true)); };
+}
+async function applyFixFlow(fid) {
+  const x = (S.diagFindings || []).find((y) => y.id === fid); if (!x?.fix) return;
+  let fix = x.fix;
+  if (fix.type === 'reconcile') { closeSheet(); return openReconcile(fix.accountId); }
+  if (fix.type === 'review-initial') fix = { type: 'delete-tx', txId: fix.txId };
+  const t = fix.txId ? S.data.transactions.find((y) => y.id === fix.txId) : null, a = t ? acc(t.accountId) : null;
+  const effect = fix.type === 'delete-tx' && t ? `رصيد «${a?.name}» سيصبح ${plain(C.balance(S.data, a) + (t.type === 'income' ? -1 : 1) * t.amount, a.currency)} بدل ${plain(C.balance(S.data, a), a.currency)}.` : fix.type === 'unlink' ? 'الحركة تبقى كما هي ولا يتغير أي رصيد؛ فقط تُفصل عن السجل المحذوف.' : 'لا يتغير أي رصيد.';
+  if (!(await confirmBox({ title: FIX_LABEL[x.fix.type] + '؟', text: `${x.title}: ${x.detail} — ${effect} يمكنك التراجع بعدها.`, ok: 'تنفيذ', danger: fix.type === 'delete-tx' }))) return;
+  try { await commit((d) => C.applyFix(d, fix), 'تم الإصلاح', { label: `إصلاح: ${x.title}` }); openDiagnostics(); } catch (e) { toast(errText(e), true); }
+}
+async function restoreUpgradeBackup() {
+  let b; try { b = await Store.readUpgradeBackup(S.session); } catch { b = null; }
+  if (!b) return toast('لا توجد نسخة أمان من الإصدار السابق على هذا الجهاز', true);
+  await restoreObject(b.data, `نسخة الأمان قبل ${C.APP_VERSION} (${dt(b.savedAt)})`);
+}
+async function retryBackup() {
+  if (!S.upgradeRaw) { S.saveBlocked = false; return save(); }
+  const r = await Store.backupBeforeUpgrade(S.upgradeRaw, S.session).catch(() => ({ ok: false }));
+  if (!r.ok) return toast('ما زال تعذر حفظ نسخة الأمان — نزّل نسخة احتياطية وتحقق من مساحة الجهاز', true);
+  S.saveBlocked = false; S.hasUpgradeBackup = true; await save(); render(); toast('تم حفظ نسخة الأمان واستئناف الحفظ');
 }
 // التحقق من صاحب الجهاز قبل الإجراءات الحساسة: بالرمز الحالي، أو Face ID، أو مفتاح الاسترداد.
 // تُختم الخزنة مسبقًا حتى يُستدعى Face ID مباشرة داخل ضغطة المستخدم (شرط Safari على الآيفون).
@@ -1123,7 +1314,7 @@ async function tryUnlock(vault, fn, viaRecovery, onFail, viaPasskey) {
     Store.lsSet(K.lockState, JSON.stringify({ fails: 0, until: 0 }));
     S.session = session; S.recoveredNeedsPin = viaRecovery;
     $('lock').hidden = true; $('lock').innerHTML = '';
-    start(C.upgrade(data));
+    await start(C.upgrade(data), data);
   } catch (e) {
     if (viaPasskey) { $('lockErr').textContent = e?.name === 'NotAllowedError' ? 'تم إلغاء Face ID' : 'تعذر الفتح بـ Face ID — استخدم الرمز'; return; }
     st.fails++; st.until = Date.now() + Sec.lockoutDelay(st.fails) * 1000; Store.lsSet(K.lockState, JSON.stringify(st));
@@ -1244,6 +1435,7 @@ document.addEventListener('click', async (e) => {
   const to = e.target.closest('[data-nav-to]'); if (to) { closeSheet(); const [v, p] = to.dataset.navTo.split('/'); return go(v, p); }
   const sc = e.target.closest('[data-shortcut]'); if (sc) return SHORTCUTS[sc.dataset.shortcut]?.[2]();
   const dt_ = e.target.closest('[data-debt-tab]'); if (dt_) { S.debtTab = dt_.dataset.debtTab; return renderDebts(); }
+  const ds_ = e.target.closest('[data-debt-status]'); if (ds_) { S.debtStatus = ds_.dataset.debtStatus; return renderDebts(); }
   const rm = e.target.closest('[data-rep-mode]'); if (rm) { S.rep.mode = rm.dataset.repMode; return renderReports(); }
   const b = e.target.closest('[data-action]'); if (!b) return;
   const id = b.dataset.id;
@@ -1258,15 +1450,33 @@ document.addEventListener('click', async (e) => {
       case 'transfer': return openTransfer();
       case 'add-account': return openAccount();
       case 'open-account': return openAccount(id);
-      case 'archive-account': { const a = acc(id); await commit((d) => C.updateAccount(d, id, { name: a.name, archived: !a.archived }), a.archived ? 'أُلغيت الأرشفة' : 'تمت الأرشفة'); return closeSheet(); }
-      case 'del-account': if (await confirmBox({ title: 'حذف الحساب؟', text: 'الحساب لا يحتوي عمليات وسيحذف نهائيًا.', ok: 'حذف', danger: true })) { await commit((d) => C.deleteAccount(d, id), 'تم حذف الحساب'); closeSheet(); } return;
+      case 'archive-account': { const a = acc(id), bal = C.balance(S.data, a);
+        if (!a.archived && !(await confirmBox({ title: 'إغلاق/أرشفة الحساب؟', text: `«${a.name}» سيختفي من قوائم الاختيار، ويبقى كشفه ورصيده (${plain(bal, a.currency)}) محفوظين${bal ? ' ومحسوبين في الإجمالي' : ''}. لا تُحذف أي حركة، ويمكنك إعادة فتحه.`, ok: 'أرشفة' }))) return;
+        if (a.archived && S.data.accounts.some((x) => x.id !== id && !x.archived && x.name === a.name)) return toast(`يوجد حساب نشط باسم «${a.name}» — غيّر اسم أحدهما أولًا`, true);
+        await commit((d) => C.updateAccount(d, id, { name: a.name, archived: !a.archived }), a.archived ? 'أُعيد فتح الحساب' : 'تمت الأرشفة', { label: `${a.archived ? 'إعادة فتح' : 'أرشفة'} الحساب «${a.name}»` }); return closeSheet(); }
+      case 'del-account': return deleteAccountFlow(id);
+      case 'reconcile': return openReconcile(id);
+      case 'undo': return undoRedo(false);
+      case 'redo': return undoRedo(true);
+      case 'diagnostics': closeSheet(); return openDiagnostics();
+      case 'dismiss-diag': S.diagDismissed = true; return renderBanners();
+      case 'apply-fix': return applyFixFlow(b.dataset.fid);
+      case 'restore-upgrade-backup': return restoreUpgradeBackup();
+      case 'retry-backup': return retryBackup();
+      case 'edit-payment': return openPayment(b.dataset.kind, id, b.dataset.pid);
+      case 'archive-item': { const coll = b.dataset.kind === 'project' ? S.data.projects : S.data.obligations, it = coll.find((x) => x.id === id); if (!it) return;
+        const nm = it.party || it.client;
+        await commit((d) => C.setArchived(d, b.dataset.kind, id, !it.archived), it.archived ? 'أُلغيت الأرشفة' : 'تمت الأرشفة — بقيت الحركات والأرصدة كما هي', { label: `${it.archived ? 'إلغاء أرشفة' : 'أرشفة'} «${nm}»` });
+        return b.dataset.kind === 'project' ? openProject(id) : openOb(id); }
       case 'account-history': S.hist = { type: 'all', account: id, month: '', q: '' }; closeSheet(); return go('history');
       case 'add-project': return openProjectForm();
       case 'open-project': return openProject(id);
       case 'edit-project': return openProjectForm(id);
       case 'pay': return openPayment(b.dataset.kind, id);
-      case 'del-payment': if (await confirmBox({ title: 'حذف الدفعة؟', text: 'ستُحذف العملية المرتبطة بها ويتحدث رصيد الحساب والمتبقي.', ok: 'حذف', danger: true })) { await commit((d) => C.deletePayment(d, b.dataset.kind, id, b.dataset.pid), 'تم حذف الدفعة'); b.dataset.kind === 'project' ? openProject(id) : openOb(id); } return;
-      case 'del-item': if (await confirmBox({ title: 'حذف نهائي؟', text: 'سيُحذف السجل مع كل دفعاته والعمليات المرتبطة به، وتعود الأرصدة كما كانت قبلها.', ok: 'حذف', danger: true })) { await commit((d) => C.deleteItem(d, b.dataset.kind, id), 'تم الحذف'); closeSheet(); } return;
+      case 'del-payment': { const coll = b.dataset.kind === 'project' ? S.data.projects : S.data.obligations, it = coll.find((x) => x.id === id), p = it?.payments.find((x) => x.id === b.dataset.pid); if (!p) return;
+        const a = acc(p.accountId), isIn = b.dataset.kind === 'project' || it.type === 'receivable';
+        if (await confirmBox({ title: 'إلغاء الدفعة؟', text: `ستُلغى دفعة ${plain(p.amount, it.currency)} وحركتها${a ? ` في «${a.name}» (${isIn ? 'ينقص' : 'يزيد'} الرصيد ${plain(p.received ?? p.amount, a.currency)})` : ''}، ويعود المبلغ إلى المتبقي. يمكنك التراجع بعدها.`, ok: 'إلغاء الدفعة', cancel: 'رجوع', danger: true })) { await commit((d) => C.deletePayment(d, b.dataset.kind, id, b.dataset.pid), 'تم إلغاء الدفعة', { label: `إلغاء دفعة «${it.party || it.client}»` }); b.dataset.kind === 'project' ? openProject(id) : openOb(id); } return; }
+      case 'del-item': return deleteItemFlow(b.dataset.kind, id);
       case 'add-ob': return openObForm(b.dataset.type);
       case 'open-ob': return openOb(id);
       case 'edit-ob': return openObForm(null, id);
@@ -1379,16 +1589,21 @@ function errorScreen(r) {
   };
   $('eWipe').onclick = () => confirmWipe();
 }
-function start(data) {
+async function start(data, raw) {
   S.data = data;
   if (!S.data.settings) S.data.settings = { displayCurrency: 'SAR' };
+  S.upgradeRaw = raw && (Number(raw.schema) || 2) < C.SCHEMA ? raw : null;
+  // نسخة أمان من البيانات كما كانت قبل ترحيل 3.1 — لا يُحفظ أي شيء فوقها قبل التأكد من نجاحها
+  if (S.upgradeRaw) { const b = await Store.backupBeforeUpgrade(S.upgradeRaw, S.session).catch(() => ({ ok: false })); S.saveBlocked = !b.ok; }
+  S.history = (await Store.loadHistory(S.session).catch(() => null)) || C.emptyHistory();
+  Store.readUpgradeBackup(S.session).then((b) => { S.hasUpgradeBackup = !!b; }).catch(() => {});
   $('app').hidden = false; $('lock').hidden = true;
   readHash(); render(); updateThemeColor(); netStatus();
   save();
   Store.getMeta('pre-restore').then((m) => { S.hasPreRestore = !!m; });
   if (S.session) Store.syncSideStores(S.session, S.session).catch(() => {});
   if (FX.isStale(S.rates, 12)) refreshRates(false);
-  if (IS_LOCAL) window.__folosi = { get data() { return S.data; }, get session() { return !!S.session; }, setRates: (r) => { S.rates = r; render(); } };
+  if (IS_LOCAL) window.__folosi = { get data() { return S.data; }, get session() { return !!S.session; }, get history() { return S.history; }, setRates: (r) => { S.rates = r; render(); } };
 }
 async function boot() {
   netStatus();
@@ -1397,7 +1612,7 @@ async function boot() {
   let r;
   try { r = await Store.loadInitial(); } catch { r = { status: 'error', reason: 'exception' }; }
   if (r.status === 'locked') return lockScreen(r.vault);
-  if (r.status === 'plain') { S.migratedFrom = r.migratedFrom; return start(r.data); }
+  if (r.status === 'plain') { S.migratedFrom = r.migratedFrom; return start(r.data, r.raw); }
   if (r.status === 'error') return errorScreen(r);
   const d = C.blank(C.suggestCurrency(navigator.languages || [navigator.language]));
   C.addAccount(d, { name: 'كاش', type: 'cash', currency: d.settings.displayCurrency, opening: 0 });

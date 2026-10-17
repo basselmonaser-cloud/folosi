@@ -75,7 +75,7 @@ export async function loadInitial() {
       // نسخة أمان من بيانات الإصدار السابق قبل أي ترحيل — لا تُستبدل أبدًا
       await idbPut('backup-before-v3', { savedAt: new Date().toISOString(), data: plain }).catch(() => {});
     }
-    return { status: 'plain', data: upgrade(plain), migratedFrom: from < SCHEMA ? from : null, dbOk };
+    return { status: 'plain', data: upgrade(plain), raw: plain, migratedFrom: from < SCHEMA ? from : null, dbOk };
   }
   const legacy = migrateV1(parse(lsGet(K.legacy)));
   if (legacy) return { status: 'plain', data: upgrade(legacy), migratedFrom: 1, dbOk };
@@ -141,7 +141,7 @@ export async function wipeAll() {
 export async function syncSideStores(fromSession, toSession) {
   const seal = async (data) => (toSession ? { vault: await sealVault(toSession, { ...data, updatedAt: data.updatedAt || new Date().toISOString() }) } : { data });
   const plainOf = async (rec) => (rec?.vault ? (fromSession ? openWithSession(rec.vault, fromSession) : null) : rec?.data ?? null);
-  for (const key of ['backup-before-v3', 'meta:pre-restore', 'legacy-v1']) {
+  for (const key of ['backup-before-v3', BACKUP_31, HISTORY, 'meta:pre-restore', 'legacy-v1']) {
     const rec = await idbGet(key); if (!rec) continue;
     if (!!rec.vault === !!toSession && (!rec.vault || !fromSession || fromSession.raw === toSession?.raw)) continue; // الحالة صحيحة أصلًا
     let data; try { data = await plainOf(rec); } catch { continue; }
@@ -153,3 +153,39 @@ export async function syncSideStores(fromSession, toSession) {
     try { await idbPut('legacy-v1', { savedAt: new Date().toISOString(), ...(await seal(JSON.parse(legacy))) }); lsDel(K.legacy); } catch {}
   }
 }
+
+// ---------- نسخة أمان قبل ترحيل 3.1 ----------
+// تُنشأ مرة واحدة من البيانات كما كانت قبل الترقية، ولا تُستبدل أبدًا. مشفرة إن كان القفل مفعّلًا.
+export const BACKUP_31 = 'backup-before-3.1';
+export async function backupBeforeUpgrade(raw, session) {
+  if (!raw || (Number(raw.schema) || 2) >= SCHEMA) return { ok: true, skipped: true };
+  const existing = await idbGet(BACKUP_31);
+  if (existing) return { ok: true, existed: true };
+  const rec = { savedAt: new Date().toISOString(), fromSchema: Number(raw.schema) || 2,
+    ...(session ? { vault: await sealVault(session, { ...raw, updatedAt: raw.updatedAt || new Date().toISOString() }) } : { data: raw }) };
+  try { await idbPut(BACKUP_31, rec); } catch { return { ok: false }; }
+  const back = await idbGet(BACKUP_31); // تحقق أن النسخة كُتبت فعلًا قبل السماح بالحفظ فوقها
+  return { ok: !!back };
+}
+export async function readUpgradeBackup(session) {
+  const rec = await idbGet(BACKUP_31); if (!rec) return null;
+  const data = rec.vault ? (session ? await openWithSession(rec.vault, session) : null) : rec.data;
+  return data ? { savedAt: rec.savedAt, fromSchema: rec.fromSchema, data } : null;
+}
+
+// ---------- سجل التراجع (آخر 5 عمليات) ----------
+// يحتوي لقطات كاملة من بياناتك، لذلك يُشفَّر بنفس مفتاح الخزنة عند تفعيل القفل ولا يُحفظ أبدًا كنص مقروء في وضع القفل.
+// لا يُنسخ إلى localStorage ولا إلى Google Drive ولا يدخل في ملفات النسخ الاحتياطي.
+const HISTORY = 'history';
+export async function saveHistory(h, session) {
+  const rec = session ? { vault: await sealVault(session, { ...h, updatedAt: new Date().toISOString() }) } : { data: h };
+  try { await idbPut(HISTORY, { savedAt: new Date().toISOString(), ...rec }); return true; } catch { return false; }
+}
+export async function loadHistory(session) {
+  const rec = await idbGet(HISTORY); if (!rec) return null;
+  try {
+    const h = rec.vault ? (session ? await openWithSession(rec.vault, session) : null) : (session ? null : rec.data); // سجل غير مشفر لا يُقبل في وضع القفل
+    return h && Array.isArray(h.undo) && Array.isArray(h.redo) ? { v: 1, undo: h.undo, redo: h.redo } : null;
+  } catch { return null; }
+}
+export const clearHistory = () => idbDel(HISTORY);

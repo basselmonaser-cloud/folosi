@@ -1,6 +1,6 @@
 // فلوسي — منطق البيانات (بدون واجهة). كل الدوال هنا قابلة للاختبار في Node.
-export const SCHEMA = 3;
-export const APP_VERSION = '3.0.2';
+export const SCHEMA = 4;
+export const APP_VERSION = '3.1.0';
 
 export const STORAGE_KEYS = Object.freeze({
   data: 'folosi_v2',            // المفتاح الأصلي — لا يتغير حفاظًا على بيانات المستخدمين
@@ -237,6 +237,7 @@ export function upgrade(input) {
     p.id ??= uid();
     p.currency = isCurrency(p.currency) ? p.currency : base;
     p.amount = Number(p.amount) || 0;
+    p.archived = !!p.archived;
     buildPayments(p, 'project');
     p.paid = paidOf(p);
   }
@@ -246,6 +247,8 @@ export function upgrade(input) {
     o.currency = isCurrency(o.currency) ? o.currency : base;
     o.amount = Number(o.amount) || 0;
     if (o.countInReports === undefined) o.countInReports = true; // سلوك 2.x: التحصيل دخل والسداد مصروف
+    o.archived = !!o.archived;
+    o.origin ??= 'legacy'; // ديون ما قبل 3.1 تبقى على سلوكها السابق تمامًا (لا تغيير تلقائي)
     buildPayments(o, 'obligation');
     o.paid = paidOf(o);
   }
@@ -393,7 +396,7 @@ export function yearSeries(data, year, rates, display = data.settings.displayCur
 }
 export function obligationTotals(data, rates, display = data.settings.displayCurrency) {
   const recv = makeTotaler(display, rates), debt = makeTotaler(display, rates);
-  for (const o of data.obligations) (o.type === 'debt' ? debt : recv).add(remainingOf(o), o.currency);
+  for (const o of data.obligations) if (!o.archived) (o.type === 'debt' ? debt : recv).add(remainingOf(o), o.currency);
   for (const p of data.projects) recv.add(remainingOf(p), p.currency);
   return { receivable: recv.result(), debt: debt.result() };
 }
@@ -470,6 +473,7 @@ export function deleteTransaction(data, id) {
     const coll = t.link.kind === 'project' ? data.projects : data.obligations;
     const item = coll.find((x) => x.id === t.link.id);
     if (item) {
+      if (item.archived && t.link.paymentId) fail('هذه الحركة مرتبطة بسجل مؤرشف — ألغِ أرشفته أولًا');
       if (t.link.paymentId) { item.payments = item.payments.filter((p) => p.id !== t.link.paymentId); item.paid = paidOf(item); }
       if (item.initialTxId === t.id) delete item.initialTxId;
     }
@@ -506,9 +510,50 @@ export function updateAccount(data, id, input) {
   if (input.archived !== undefined) a.archived = !!input.archived;
   return touch(a);
 }
-export function deleteAccount(data, id) {
-  if (accountInUse(data, id)) fail('لا يمكن حذف حساب عليه عمليات أو تحويلات؛ يمكنك أرشفته بدلًا من ذلك');
-  data.accounts = data.accounts.filter((a) => a.id !== id);
+// معاينة أثر تعديل الرصيد الافتتاحي قبل الحفظ
+export function previewOpening(data, id, newOpening) {
+  const a = data.accounts.find((x) => x.id === id) || fail('الحساب غير موجود');
+  const next = signedAmount(newOpening, a.currency, 'الرصيد الافتتاحي');
+  const current = balance(data, a);
+  return { current, next: round(current - (Number(a.opening) || 0) + next, a.currency), delta: round(next - (Number(a.opening) || 0), a.currency) };
+}
+// تسوية الرصيد مع كشف البنك: حركة تسوية واضحة بالفرق (لا تُحتسب دخلًا أو مصروفًا) بدل تعديل الأرقام
+export function reconcileAccount(data, id, input) {
+  const a = account(data, id);
+  const statement = signedAmount(input.statement, a.currency, 'رصيد الكشف');
+  const diff = round(statement - balance(data, a), a.currency);
+  if (Math.abs(diff) < 10 ** -decimals(a.currency) / 2) fail('الرصيد مطابق لكشف البنك — لا حاجة لتسوية');
+  const t = { id: uid(), created: Date.now(), type: diff > 0 ? 'income' : 'expense', amount: Math.abs(diff), currency: a.currency, accountId: a.id,
+    category: 'تسوية رصيد', note: text(input.note, 200) || `تسوية مع الكشف: ${statement}`, date: input.date ? optDate(input.date) : today(), excludeFromReports: true, kind: 'adjustment' };
+  data.transactions.push(t);
+  return t;
+}
+// كل ما يرتبط بحساب (لعرضه قبل أي إجراء على الحساب)
+export function accountUsage(data, id) {
+  return { transactions: data.transactions.filter((t) => t.accountId === id).length, transfers: data.transfers.filter((t) => t.from === id || t.to === id).length,
+    recurring: data.recurring.filter((r) => r.accountId === id).length,
+    payments: [...data.projects, ...data.obligations].reduce((n, i) => n + (i.payments || []).filter((p) => p.accountId === id).length, 0) };
+}
+// حذف حساب: بدون حركات = حذف عادي. عليه حركات = دمج كل حركاته في حساب آخر بنفس العملة (لا يُفقد شيء)، أو الأرشفة.
+export function deleteAccount(data, id, opts = {}) {
+  const a = data.accounts.find((x) => x.id === id) || fail('الحساب غير موجود');
+  if (!accountInUse(data, id) && !accountUsage(data, id).payments) { data.accounts = data.accounts.filter((x) => x.id !== id); return { deleted: true }; }
+  if (opts.mode !== 'merge') fail('لا يمكن حذف حساب عليه حركات دون تحديد مصيرها: أرشفه، أو انقل حركاته إلى حساب آخر');
+  const target = data.accounts.find((x) => x.id === opts.targetId) || fail('اختر الحساب الذي تنتقل إليه الحركات');
+  if (target.id === id) fail('اختر حسابًا مختلفًا');
+  if (target.currency !== a.currency) fail('يجب أن يكون الحساب الجديد بنفس العملة');
+  const before = balance(data, a) + balance(data, target);
+  target.opening = round((Number(target.opening) || 0) + (Number(a.opening) || 0), target.currency);
+  for (const t of data.transactions) if (t.accountId === id) t.accountId = target.id;
+  let removedSelf = 0;
+  for (const t of data.transfers) { if (t.from === id) t.from = target.id; if (t.to === id) t.to = target.id; }
+  data.transfers = data.transfers.filter((t) => (t.from === t.to ? (removedSelf++, false) : true)); // تحويل بين الحسابين صار داخليًا: أثره صفر
+  for (const r of data.recurring) if (r.accountId === id) r.accountId = target.id;
+  for (const i of [...data.projects, ...data.obligations]) for (const p of i.payments || []) if (p.accountId === id) p.accountId = target.id;
+  data.accounts = data.accounts.filter((x) => x.id !== id);
+  const after = balance(data, target);
+  if (Math.abs(after - before) > 1e-6) fail('تعذر الدمج دون تغيير الرصيد — لم يتغير شيء');
+  return { merged: true, removedSelf };
 }
 
 // ---------- التحويلات ----------
@@ -555,27 +600,48 @@ export function updateProject(data, id, input) {
   p.amount = amount;
   return touch(p);
 }
+// أصل الدين يحدد أثر السداد على التقارير، والرصيد يتغير مرة واحدة فقط في كل الحالات:
+//  دين عليّ:  received = استلمت المال في حساب (يدخل الحساب الآن، والسداد حركة رصيد فقط)
+//             credit   = شراء/خدمة بالآجل (السداد يُحتسب مصروفًا مرة واحدة)
+//             old      = دين سابق قبل فلوسي (السداد حركة رصيد فقط — لا ازدواج)
+//  دين لي:    lent     = أعطيت المال من حساب (يخرج الآن، والتحصيل حركة رصيد فقط)
+//             earned   = عمل/بيع لم يُدفع (التحصيل يُحتسب دخلًا مرة واحدة)
+//             old      = مستحق سابق قبل فلوسي (التحصيل حركة رصيد فقط)
+//  legacy = ديون ما قبل 3.1، تبقى على إعدادها السابق
+export const DEBT_ORIGINS = {
+  debt: { received: 'استلمت المبلغ في أحد حساباتي (قرض)', credit: 'شراء أو خدمة بالآجل', old: 'دين سابق قبل استخدام فلوسي' },
+  receivable: { lent: 'أعطيت المبلغ من أحد حساباتي (سلفة)', earned: 'عمل أو بيع لم يُدفع بعد', old: 'مستحق سابق قبل استخدام فلوسي' },
+};
+const ORIGIN_COUNTS = { received: false, credit: true, old: false, lent: false, earned: true };
+export const originCounts = (o) => (o.origin && o.origin in ORIGIN_COUNTS ? ORIGIN_COUNTS[o.origin] : !!o.countInReports);
+export function obligationStatus(o) { return o.archived ? 'archived' : remainingOf(o) <= 0 ? 'settled' : 'active'; }
+export const STATUS_LABELS = { active: 'نشط', settled: 'مسدد', archived: 'مؤرشف' };
+
 export function addObligation(data, input) {
   const currency = isCurrency(input.currency) ? input.currency : data.settings.displayCurrency;
   const type = input.type === 'debt' ? 'debt' : 'receivable';
-  const o = { id: uid(), created: Date.now(), type, party: text(input.party, 100) || fail('اكتب اسم الشخص أو الجهة'),
+  let origin = input.origin;
+  if (!origin) origin = input.movementAccountId ? (type === 'debt' ? 'received' : 'lent') : (type === 'debt' ? 'credit' : 'earned'); // توافق مع 3.0
+  if (!(origin in DEBT_ORIGINS[type])) fail('اختر أصل الدين');
+  const o = { id: uid(), created: Date.now(), type, origin, party: text(input.party, 100) || fail('اكتب اسم الشخص أو الجهة'),
     amount: requireAmount(input.amount, currency), currency, phone: text(input.phone, 35), due: optDate(input.due),
-    repeat: ['weekly', 'monthly', 'yearly'].includes(input.repeat) ? input.repeat : 'none', note: text(input.note, 300), payments: [], paid: 0, countInReports: true };
-  if (input.movementAccountId) {
-    // سلفة أعطيتها (يخرج المال) أو قرض استلمته (يدخل المال) — حركة رصيد لا تحتسب دخلًا أو مصروفًا
-    const acc = account(data, input.movementAccountId);
+    repeat: ['weekly', 'monthly', 'yearly'].includes(input.repeat) ? input.repeat : 'none', note: text(input.note, 300), payments: [], paid: 0,
+    countInReports: ORIGIN_COUNTS[origin], archived: false };
+  if (origin === 'received' || origin === 'lent') {
+    const acc = account(data, input.movementAccountId || fail(origin === 'received' ? 'اختر الحساب الذي استلمت فيه المبلغ' : 'اختر الحساب الذي خرج منه المبلغ'));
     const amt = acc.currency === currency ? o.amount : (Number(input.movementRate) > 0 ? round(o.amount * Number(input.movementRate), acc.currency) : fail(`أدخل سعر التحويل من ${currency} إلى ${acc.currency}`));
     const t = { id: uid(), created: Date.now(), type: type === 'receivable' ? 'expense' : 'income', amount: amt, currency: acc.currency,
-      accountId: acc.id, category: type === 'receivable' ? 'سلفة لشخص' : 'قرض مستلم', note: o.party, date: today(), excludeFromReports: true,
+      accountId: acc.id, category: type === 'receivable' ? 'سلفة لشخص' : 'قرض مستلم', note: o.party, date: input.date ? optDate(input.date) : today(), excludeFromReports: true,
       link: { kind: 'obligation', id: o.id } };
     data.transactions.push(t);
-    o.initialTxId = t.id; o.countInReports = false;
+    o.initialTxId = t.id;
   }
   data.obligations.push(o);
   return o;
 }
 export function updateObligation(data, id, input) {
   const o = data.obligations.find((x) => x.id === id) || fail('الدين غير موجود');
+  if (o.archived) fail('هذا الدين مؤرشف — ألغِ الأرشفة أولًا');
   o.party = text(input.party, 100) || fail('اكتب اسم الشخص أو الجهة');
   o.phone = text(input.phone, 35); o.note = text(input.note, 300); o.due = optDate(input.due);
   if (input.repeat) o.repeat = ['weekly', 'monthly', 'yearly'].includes(input.repeat) ? input.repeat : 'none';
@@ -587,43 +653,87 @@ export function updateObligation(data, id, input) {
 function itemOf(data, kind, id) {
   return (kind === 'project' ? data.projects : data.obligations).find((x) => x.id === id) || fail('السجل غير موجود');
 }
-// دفعة لمشروع أو دين: تسجل مرة واحدة كعملية مرتبطة (لا تكرار في الإيرادات)
+function paymentTxFields(data, kind, item, input, excludeId) {
+  const amount = requireAmount(input.amount, item.currency, 'قيمة الدفعة');
+  const others = round((item.payments || []).filter((p) => p.id !== excludeId).reduce((a, p) => a + Number(p.amount || 0), 0), item.currency);
+  const rem = round(Math.max(0, item.amount - others), item.currency);
+  if (amount - rem > 1e-9) fail(`الدفعة أكبر من المتبقي (${rem})`);
+  const acc = account(data, input.accountId);
+  const received = acc.currency !== item.currency ? requireAmount(input.received, acc.currency, `المبلغ ${kind === 'obligation' && item.type === 'debt' ? 'المدفوع' : 'المستلم'} بعملة ${acc.currency}`) : amount;
+  const date = input.date ? optDate(input.date) : today();
+  return { amount, received, date, acc };
+}
+// منع تسجيل نفس الدفعة مرتين (ضغطتان سريعتان أو إعادة إرسال)
+export function findDuplicatePayment(data, kind, id, input, now = Date.now(), windowMs = 60000) {
+  const item = itemOf(data, kind, id), n = parseAmount(input.amount);
+  return (item.payments || []).find((p) => Math.abs(p.amount - n) < 1e-9 && p.accountId === input.accountId && p.date === (input.date || today()) && now - (p.created || 0) < windowMs) || null;
+}
+// دفعة لمشروع أو دين: تُسجل مرة واحدة كحركة واحدة مرتبطة — الرصيد يتغير مرة واحدة، والمتبقي ينخفض بالمقدار نفسه
 export function addPayment(data, kind, id, input) {
   const item = itemOf(data, kind, id);
-  const amount = requireAmount(input.amount, item.currency, 'قيمة الدفعة');
-  if (amount - remainingOf(item) > 1e-9) fail(`الدفعة أكبر من المتبقي (${remainingOf(item)})`);
-  const acc = account(data, input.accountId);
-  let received = amount;
-  if (acc.currency !== item.currency) {
-    received = requireAmount(input.received, acc.currency, `المبلغ المستلم بعملة ${acc.currency}`);
-  }
-  const date = input.date ? optDate(input.date) : today();
-  const p = { id: uid(), amount, received, date, accountId: acc.id };
+  if (item.archived) fail('هذا السجل مؤرشف — ألغِ الأرشفة أولًا');
+  const { amount, received, date, acc } = paymentTxFields(data, kind, item, input);
+  const p = { id: uid(), created: Date.now(), amount, received, date, accountId: acc.id };
   const isIn = kind === 'project' || item.type === 'receivable';
   const t = { id: uid(), created: Date.now(), type: isIn ? 'income' : 'expense', amount: received, currency: acc.currency, accountId: acc.id,
     category: isIn ? 'تحصيل مستحقات' : 'سداد ديون', note: kind === 'project' ? `${item.client} — ${item.name}` : item.party, date,
     link: { kind, id: item.id, paymentId: p.id } };
-  if (kind === 'obligation' && !item.countInReports) t.excludeFromReports = true;
+  if (kind === 'obligation' && !originCounts(item)) t.excludeFromReports = true;
   if (acc.currency !== item.currency) Object.assign(t, { origAmount: amount, origCurrency: item.currency, rate: received / amount });
   p.txId = t.id;
   item.payments.push(p); item.paid = paidOf(item);
   data.transactions.push(t);
   return p;
 }
+// تعديل دفعة سابقة: تُحدَّث الدفعة وحركتها المرتبطة معًا فيبقى الرصيد والمتبقي متطابقين
+export function updatePayment(data, kind, id, paymentId, input) {
+  const item = itemOf(data, kind, id);
+  if (item.archived) fail('السجل مؤرشف — ألغِ الأرشفة أولًا');
+  const p = item.payments.find((x) => x.id === paymentId) || fail('الدفعة غير موجودة');
+  if (p.legacy) fail('هذه دفعة من إصدار سابق دون حركة مرتبطة — لا يمكن تعديلها');
+  const { amount, received, date, acc } = paymentTxFields(data, kind, item, input, paymentId);
+  Object.assign(p, { amount, received, date, accountId: acc.id });
+  const t = data.transactions.find((x) => x.id === p.txId);
+  if (t) {
+    Object.assign(t, { amount: received, currency: acc.currency, accountId: acc.id, date });
+    for (const k of ['origAmount', 'origCurrency', 'rate']) delete t[k];
+    if (acc.currency !== item.currency) Object.assign(t, { origAmount: amount, origCurrency: item.currency, rate: received / amount });
+    touch(t);
+  }
+  item.paid = paidOf(item);
+  return p;
+}
+// إلغاء دفعة: تُحذف الدفعة وحركتها المرتبطة معًا (يعود المبلغ للحساب وللمتبقي)
 export function deletePayment(data, kind, id, paymentId) {
   const item = itemOf(data, kind, id);
+  if (item.archived) fail('السجل مؤرشف — ألغِ الأرشفة أولًا');
   const p = item.payments.find((x) => x.id === paymentId);
   if (!p) return;
   if (p.txId) data.transactions = data.transactions.filter((t) => t.id !== p.txId);
   item.payments = item.payments.filter((x) => x.id !== paymentId);
   item.paid = paidOf(item);
 }
-// حذف مشروع/دين مع عملياته المرتبطة (الأرصدة تعود كما كانت قبل الدفعات)
-export function deleteItem(data, kind, id) {
+export function setArchived(data, kind, id, archived) {
   const item = itemOf(data, kind, id);
-  const ids = new Set(item.payments.map((p) => p.txId).filter(Boolean));
-  if (item.initialTxId) ids.add(item.initialTxId);
-  data.transactions = data.transactions.filter((t) => !ids.has(t.id));
+  if (archived && remainingOf(item) > 0) fail('لا يمكن أرشفة سجل لم يُسدد بالكامل — سجّل السداد أو اختر الحذف');
+  item.archived = !!archived; item.archivedAt = archived ? new Date().toISOString() : undefined;
+  return touch(item);
+}
+const linkedTxIds = (item) => { const ids = new Set(item.payments.map((p) => p.txId).filter(Boolean)); if (item.initialTxId) ids.add(item.initialTxId); return ids; };
+// أثر الحذف على كل حساب (يُعرض قبل التأكيد)
+export function itemDeleteEffects(data, kind, id) {
+  const item = itemOf(data, kind, id), ids = linkedTxIds(item), byAcc = {};
+  for (const t of data.transactions) if (ids.has(t.id)) byAcc[t.accountId] = round((byAcc[t.accountId] || 0) - (t.type === 'income' ? 1 : -1) * t.amount, t.currency);
+  return { linked: ids.size, reverse: Object.entries(byAcc).map(([accountId, delta]) => ({ accountId, delta })) };
+}
+// حذف مشروع/دين — يجب تحديد مصير الحركات صراحة:
+//   keep    = حذف السجل فقط والإبقاء على الحركات كحركات عادية (الأرصدة لا تتغير)
+//   reverse = حذف السجل مع حركاته (تعود الأرصدة كما كانت قبل الدفعات) — يتطلب تأكيدًا واضحًا
+export function deleteItem(data, kind, id, opts = {}) {
+  const item = itemOf(data, kind, id), ids = linkedTxIds(item);
+  if (ids.size && !['keep', 'reverse'].includes(opts.mode)) fail('حدد مصير الحركات المرتبطة قبل الحذف');
+  if (opts.mode === 'reverse') data.transactions = data.transactions.filter((t) => !ids.has(t.id));
+  else for (const t of data.transactions) if (ids.has(t.id)) { delete t.link; t.note = [t.note, kind === 'project' ? '(مشروع محذوف)' : '(دين محذوف)'].filter(Boolean).join(' '); }
   if (kind === 'project') data.projects = data.projects.filter((x) => x.id !== id);
   else data.obligations = data.obligations.filter((x) => x.id !== id);
 }
@@ -705,4 +815,107 @@ export function toCSV(data) {
 export function isEmpty(data) {
   return !data || (!data.transactions?.length && !data.transfers?.length && !data.projects?.length && !data.obligations?.length && !data.goals?.length && !data.recurring?.length &&
     (data.accounts || []).every((a) => !Number(a.opening)));
+}
+
+// ---------- التراجع والإعادة (آخر 5 عمليات) ----------
+// كل عملية تحفظ لقطة كاملة لما قبلها، فالتراجع يعيد كل الحسابات والحركات والديون المرتبطة معًا.
+// لا يُسمح بالتراجع إلا إذا كانت البيانات الحالية هي نفسها التي نتجت عن العملية (بصمة متطابقة) — وإلا قد تتلف البيانات.
+export const HISTORY_LIMIT = 5;
+export const emptyHistory = () => ({ v: 1, undo: [], redo: [] });
+function cyrb53(str, seed = 0) {
+  let h1 = 0xdeadbeef ^ seed, h2 = 0x41c6ce57 ^ seed;
+  for (let i = 0; i < str.length; i++) { const ch = str.charCodeAt(i); h1 = Math.imul(h1 ^ ch, 2654435761); h2 = Math.imul(h2 ^ ch, 1597334677); }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+}
+// البصمة تتجاهل وقت الحفظ والإعدادات (المظهر، العملة…) حتى لا تمنع التراجع
+export const stateHash = (data) => cyrb53(JSON.stringify({ ...data, updatedAt: null, settings: null }));
+export function recordHistory(h, label, beforeJSON, after) {
+  const undo = [...(h?.undo || []), { id: uid(), at: new Date().toISOString(), label, snapshot: beforeJSON, expect: stateHash(after) }];
+  return { v: 1, undo: undo.slice(-HISTORY_LIMIT), redo: [] }; // عملية جديدة تمسح قائمة الإعادة
+}
+function stepHistory(h, current, from, to) {
+  const stack = h?.[from] || [];
+  const top = stack[stack.length - 1];
+  if (!top) return { ok: false, reason: from === 'undo' ? 'لا توجد عمليات للتراجع عنها' : 'لا توجد عمليات لإعادتها' };
+  if (stateHash(current) !== top.expect) return { ok: false, stale: true, reason: 'تغيّرت البيانات بعد هذه العملية (استعادة نسخة، أو تعديل من نافذة أخرى). التراجع الآن قد يتلف البيانات، لذلك أُوقف.' };
+  let restored;
+  try { restored = JSON.parse(top.snapshot); } catch { return { ok: false, reason: 'سجل التراجع تالف — لم يتغير شيء' }; }
+  if (!isStructurallyValid(restored) || validateImport(restored).length) return { ok: false, reason: 'سجل التراجع غير صالح — لم يتغير شيء' };
+  restored.settings = current.settings; // لا نعيد المظهر والعملة مع التراجع
+  const entry = { id: uid(), at: new Date().toISOString(), label: top.label, snapshot: JSON.stringify(current), expect: stateHash(restored) };
+  return { ok: true, data: restored, label: top.label, history: { v: 1, [from]: stack.slice(0, -1), [to]: [...(h[to] || []), entry].slice(-HISTORY_LIMIT) } };
+}
+export const undoHistory = (h, current) => stepHistory(h, current, 'undo', 'redo');
+export const redoHistory = (h, current) => stepHistory(h, current, 'redo', 'undo');
+// أثر التراجع/الإعادة على أرصدة الحسابات (يُعرض للتأكيد)
+export function balanceDiff(a, b) {
+  const out = [];
+  const ids = new Set([...a.accounts.map((x) => x.id), ...b.accounts.map((x) => x.id)]);
+  for (const id of ids) {
+    const x = a.accounts.find((v) => v.id === id), y = b.accounts.find((v) => v.id === id);
+    const bx = x ? balance(a, x) : 0, by = y ? balance(b, y) : 0;
+    if (Math.abs(bx - by) > 1e-9 || !x !== !y) out.push({ id, name: (y || x).name, currency: (y || x).currency, from: bx, to: by, added: !x, removed: !y });
+  }
+  return out;
+}
+
+// ---------- تشخيص الأرصدة (قراءة فقط — لا يغيّر شيئًا) ----------
+export function diagnose(data) {
+  const f = [], acc = (id) => data.accounts.find((a) => a.id === id);
+  const add = (severity, code, title, detail, fix) => f.push({ id: code + ':' + f.length, severity, code, title, detail, fix });
+  const items = [...data.projects.map((i) => ['project', i]), ...data.obligations.map((i) => ['obligation', i])];
+  // 1) حركات مرتبطة بسجل أو دفعة غير موجودة
+  for (const t of data.transactions) {
+    if (!t.link) continue;
+    const item = items.find(([k, i]) => k === t.link.kind && i.id === t.link.id)?.[1];
+    if (!item) add('warn', 'orphan-link', 'حركة مرتبطة بسجل محذوف', `${t.category} ${t.amount} ${t.currency} بتاريخ ${t.date} — ما زالت تؤثر على رصيد «${acc(t.accountId)?.name || '؟'}».`, { type: 'unlink', txId: t.id });
+    else if (t.link.paymentId && !item.payments.some((p) => p.id === t.link.paymentId)) add('warn', 'orphan-payment', 'حركة سداد لا تقابلها دفعة', `${t.amount} ${t.currency} بتاريخ ${t.date} مرتبطة بـ«${item.party || item.name}» لكن الدفعة غير موجودة.`, { type: 'unlink', txId: t.id });
+  }
+  // 2) دفعات بلا حركة، أو مجموع المسدد غير مطابق
+  for (const [kind, i] of items) {
+    for (const p of i.payments || []) if (!p.legacy && p.txId && !data.transactions.some((t) => t.id === p.txId))
+      add('error', 'payment-no-tx', 'دفعة بلا حركة على الحساب', `دفعة ${p.amount} ${i.currency} في «${i.party || i.name}» لم تُخصم/تُضف لأي حساب.`, { type: 'drop-payment', kind, itemId: i.id, paymentId: p.id });
+    if (Math.abs((Number(i.paid) || 0) - paidOf(i)) > 1e-6) add('info', 'paid-mismatch', 'قيمة «المسدد» المخزنة غير محدّثة', `«${i.party || i.name}»: المخزن ${i.paid} والفعلي ${paidOf(i)}.`, { type: 'recalc-paid', kind, itemId: i.id });
+  }
+  // 3) سداد محتمل مسجل مرتين: مصروف يدوي «سداد ديون» + دفعة دين بنفس المبلغ خلال 7 أيام
+  const day = (d) => Date.parse(d + 'T12:00:00') / 864e5;
+  for (const t of data.transactions) {
+    if (t.link || t.type !== 'expense' || !/سداد/.test(t.category)) continue;
+    const twin = data.transactions.find((x) => x.link?.kind === 'obligation' && x.link.paymentId && x.type === 'expense' && x.accountId === t.accountId && Math.abs(x.amount - t.amount) < 1e-9 && Math.abs(day(x.date) - day(t.date)) <= 7);
+    if (twin) add('error', 'double-payment', 'سداد قد يكون مسجلًا مرتين', `مصروف يدوي «${t.category}» ${t.amount} ${t.currency} بتاريخ ${t.date}، وسداد دين مرتبط بنفس المبلغ بتاريخ ${twin.date} من نفس الحساب «${acc(t.accountId)?.name}».`, { type: 'delete-tx', txId: t.id });
+  }
+  // 4) عمليات مكررة بالكامل في نفس اليوم
+  const seen = new Map();
+  for (const t of data.transactions) {
+    if (t.link) continue;
+    const k = [t.type, t.accountId, t.amount, t.category, t.date, t.note].join('|');
+    if (seen.has(k)) add('warn', 'duplicate-tx', 'عملية مكررة محتملة', `${t.type === 'income' ? 'دخل' : 'مصروف'} ${t.amount} ${t.currency} «${t.category}» بتاريخ ${t.date} في «${acc(t.accountId)?.name}» مسجلة أكثر من مرة.`, { type: 'delete-tx', txId: t.id });
+    else seen.set(k, t.id);
+  }
+  // 5) ديون أضافت مالًا لحساب عند إنشائها — للتأكد أن المال استُلم فعلًا
+  for (const o of data.obligations) {
+    if (!o.initialTxId) continue;
+    const t = data.transactions.find((x) => x.id === o.initialTxId);
+    if (t) add('info', 'initial-movement', o.type === 'debt' ? 'دين أضاف مبلغه لحسابك عند إنشائه' : 'مستحق خصم مبلغه من حسابك عند إنشائه', `«${o.party}»: ${t.type === 'income' ? '+' : '−'}${t.amount} ${t.currency} في «${acc(t.accountId)?.name}» بتاريخ ${t.date}. إن لم يحدث هذا فعلًا فالرصيد غير صحيح.`, { type: 'review-initial', txId: t.id, itemId: o.id });
+  }
+  // 6) مراجع لحسابات غير موجودة
+  for (const t of data.transactions) if (!acc(t.accountId)) add('error', 'missing-account', 'حركة على حساب غير موجود', `${t.category} ${t.amount} بتاريخ ${t.date}.`, null);
+  for (const t of data.transfers) if (!acc(t.from) || !acc(t.to)) add('error', 'missing-account', 'تحويل يشير إلى حساب غير موجود', `${t.amount} بتاريخ ${t.date}.`, null);
+  // 7) أرصدة سالبة في نقد/بنك/محفظة
+  for (const a of data.accounts) { const b = balance(data, a); if (b < 0 && a.type !== 'card') add('warn', 'negative', `رصيد سالب: ${a.name}`, `الرصيد المحسوب ${b} ${a.currency}. قارنه بكشف الحساب واستخدم «تسوية مع الكشف» إن لزم.`, { type: 'reconcile', accountId: a.id }); }
+  // 8) أسماء حسابات مكررة
+  const names = {}; for (const a of data.accounts) if (!a.archived) (names[a.name] ||= []).push(a);
+  for (const [n, list] of Object.entries(names)) if (list.length > 1) add('info', 'same-name', `أكثر من حساب نشط باسم «${n}»`, 'قد يسبب اختيار الحساب الخطأ عند التسجيل.', null);
+  return f;
+}
+// تنفيذ إصلاح مقترح — يُستدعى فقط بضغطة من المستخدم، ويُسجل في التراجع
+export function applyFix(data, fix) {
+  if (!fix) fail('لا يوجد إصلاح تلقائي لهذه الحالة');
+  if (fix.type === 'unlink') { const t = data.transactions.find((x) => x.id === fix.txId) || fail('الحركة غير موجودة'); delete t.link; return 'أُلغي الربط وبقيت الحركة كما هي'; }
+  if (fix.type === 'delete-tx') { deleteTransaction(data, fix.txId); return 'حُذفت الحركة'; }
+  if (fix.type === 'drop-payment') { const i = itemOf(data, fix.kind, fix.itemId); i.payments = i.payments.filter((p) => p.id !== fix.paymentId); i.paid = paidOf(i); return 'حُذفت الدفعة التي لا تقابلها حركة'; }
+  if (fix.type === 'recalc-paid') { const i = itemOf(data, fix.kind, fix.itemId); i.paid = paidOf(i); return 'حُدّثت قيمة المسدد'; }
+  fail('هذا الإصلاح يحتاج قرارًا منك من الشاشة المناسبة');
 }

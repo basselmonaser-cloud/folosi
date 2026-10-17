@@ -1,6 +1,6 @@
 // فلوسي — Service Worker. يخزن ملفات التطبيق فقط (لا يلمس بياناتك المالية).
 // غيّر VERSION مع كل إصدار حتى يكتشف الجهاز وجود تحديث.
-const VERSION = '3.0.2';
+const VERSION = '3.1.0';
 const CACHE = 'folosi-app-' + VERSION;
 const ASSETS = [
   './', './index.html', './privacy.html', './manifest.webmanifest', './css/app.css',
